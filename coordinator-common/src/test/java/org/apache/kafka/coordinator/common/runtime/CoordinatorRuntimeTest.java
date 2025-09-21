@@ -18,28 +18,20 @@ package org.apache.kafka.coordinator.common.runtime;
 
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.config.TopicConfig;
 import org.apache.kafka.common.errors.NotCoordinatorException;
 import org.apache.kafka.common.errors.NotEnoughReplicasException;
 import org.apache.kafka.common.errors.RecordTooLargeException;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
-import org.apache.kafka.common.record.AbstractRecords;
-import org.apache.kafka.common.record.CompressionType;
 import org.apache.kafka.common.record.ControlRecordType;
-import org.apache.kafka.common.record.EndTransactionMarker;
 import org.apache.kafka.common.record.MemoryRecords;
-import org.apache.kafka.common.record.MemoryRecordsBuilder;
 import org.apache.kafka.common.record.RecordBatch;
-import org.apache.kafka.common.record.RecordVersion;
-import org.apache.kafka.common.record.SimpleRecord;
-import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.requests.TransactionResult;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.image.MetadataDelta;
 import org.apache.kafka.image.MetadataImage;
-import org.apache.kafka.image.MetadataProvenance;
 import org.apache.kafka.server.util.FutureUtils;
 import org.apache.kafka.server.util.timer.MockTimer;
 import org.apache.kafka.storage.internals.log.LogConfig;
@@ -53,7 +45,6 @@ import org.mockito.ArgumentMatcher;
 
 import java.nio.BufferOverflowException;
 import java.nio.ByteBuffer;
-import java.nio.charset.Charset;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -76,7 +67,10 @@ import static org.apache.kafka.coordinator.common.runtime.CoordinatorRuntime.Coo
 import static org.apache.kafka.coordinator.common.runtime.CoordinatorRuntime.CoordinatorState.INITIAL;
 import static org.apache.kafka.coordinator.common.runtime.CoordinatorRuntime.CoordinatorState.LOADING;
 import static org.apache.kafka.coordinator.common.runtime.CoordinatorRuntime.HighWatermarkListener.NO_OFFSET;
-import static org.apache.kafka.coordinator.common.runtime.CoordinatorRuntime.MIN_BUFFER_SIZE;
+import static org.apache.kafka.coordinator.common.runtime.CoordinatorRuntime.INITIAL_BUFFER_SIZE;
+import static org.apache.kafka.coordinator.common.runtime.TestUtil.endTransactionMarker;
+import static org.apache.kafka.coordinator.common.runtime.TestUtil.records;
+import static org.apache.kafka.coordinator.common.runtime.TestUtil.transactionalRecords;
 import static org.apache.kafka.test.TestUtils.assertFutureThrows;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -102,123 +96,6 @@ public class CoordinatorRuntimeTest {
     private static final Duration DEFAULT_WRITE_TIMEOUT = Duration.ofMillis(5);
 
     private static final short TXN_OFFSET_COMMIT_LATEST_VERSION = ApiKeys.TXN_OFFSET_COMMIT.latestVersion();
-
-    private static MemoryRecords records(
-        long timestamp,
-        String... records
-    ) {
-        return records(timestamp, Arrays.stream(records).collect(Collectors.toList()));
-    }
-
-    private static MemoryRecords records(
-        long timestamp,
-        List<String> records
-    ) {
-        if (records.isEmpty())
-            return MemoryRecords.EMPTY;
-
-        List<SimpleRecord> simpleRecords = records.stream().map(record ->
-            new SimpleRecord(timestamp, record.getBytes(Charset.defaultCharset()))
-        ).collect(Collectors.toList());
-
-        int sizeEstimate = AbstractRecords.estimateSizeInBytes(
-            RecordVersion.current().value,
-            CompressionType.NONE,
-            simpleRecords
-        );
-
-        ByteBuffer buffer = ByteBuffer.allocate(sizeEstimate);
-
-        MemoryRecordsBuilder builder = MemoryRecords.builder(
-            buffer,
-            RecordVersion.current().value,
-            Compression.NONE,
-            TimestampType.CREATE_TIME,
-            0L,
-            timestamp,
-            RecordBatch.NO_PRODUCER_ID,
-            RecordBatch.NO_PRODUCER_EPOCH,
-            0,
-            false,
-            RecordBatch.NO_PARTITION_LEADER_EPOCH
-        );
-
-        simpleRecords.forEach(builder::append);
-
-        return builder.build();
-    }
-
-    private static MemoryRecords transactionalRecords(
-        long producerId,
-        short producerEpoch,
-        long timestamp,
-        String... records
-    ) {
-        return transactionalRecords(
-            producerId,
-            producerEpoch,
-            timestamp,
-            Arrays.stream(records).collect(Collectors.toList())
-        );
-    }
-
-    private static MemoryRecords transactionalRecords(
-        long producerId,
-        short producerEpoch,
-        long timestamp,
-        List<String> records
-    ) {
-        if (records.isEmpty())
-            return MemoryRecords.EMPTY;
-
-        List<SimpleRecord> simpleRecords = records.stream().map(record ->
-            new SimpleRecord(timestamp, record.getBytes(Charset.defaultCharset()))
-        ).collect(Collectors.toList());
-
-        int sizeEstimate = AbstractRecords.estimateSizeInBytes(
-            RecordVersion.current().value,
-            CompressionType.NONE,
-            simpleRecords
-        );
-
-        ByteBuffer buffer = ByteBuffer.allocate(sizeEstimate);
-
-        MemoryRecordsBuilder builder = MemoryRecords.builder(
-            buffer,
-            RecordVersion.current().value,
-            Compression.NONE,
-            TimestampType.CREATE_TIME,
-            0L,
-            timestamp,
-            producerId,
-            producerEpoch,
-            0,
-            true,
-            RecordBatch.NO_PARTITION_LEADER_EPOCH
-        );
-
-        simpleRecords.forEach(builder::append);
-
-        return builder.build();
-    }
-
-    private static MemoryRecords endTransactionMarker(
-        long producerId,
-        short producerEpoch,
-        long timestamp,
-        int coordinatorEpoch,
-        ControlRecordType result
-    ) {
-        return MemoryRecords.withEndTransactionMarker(
-            timestamp,
-            producerId,
-            producerEpoch,
-            new EndTransactionMarker(
-                result,
-                coordinatorEpoch
-            )
-        );
-    }
 
     @Test
     public void testScheduleLoading() {
@@ -277,7 +154,7 @@ public class CoordinatorRuntimeTest {
         assertEquals(ACTIVE, ctx.state);
 
         // Verify that onLoaded is called.
-        verify(coordinator, times(1)).onLoaded(MetadataImage.EMPTY);
+        verify(coordinator, times(1)).onLoaded(CoordinatorMetadataImage.EMPTY);
 
         // Verify that the listener is registered.
         verify(writer, times(1)).registerListener(
@@ -773,42 +650,37 @@ public class CoordinatorRuntimeTest {
         runtime.scheduleLoadOperation(TP, 10);
         CoordinatorRuntime<MockCoordinatorShard, String>.CoordinatorContext ctx = runtime.contextOrThrow(TP);
 
-        // Get the max batch size.
-        int maxBatchSize = writer.config(TP).maxMessageSize();
-
-        // Create records with three quarters of the max batch size each, so that it is not
-        // possible to have more than one record in a single batch.
-        List<String> records = Stream.of('1', '2', '3').map(c -> {
-            char[] payload = new char[maxBatchSize * 3 / 4];
-            Arrays.fill(payload, c);
-            return new String(payload);
-        }).collect(Collectors.toList());
-
         // Write #1.
         CompletableFuture<String> write1 = runtime.scheduleWriteOperation("write#1", TP, Duration.ofMillis(20),
-            state -> new CoordinatorResult<>(List.of(records.get(0)), "response1")
+            state -> new CoordinatorResult<>(List.of("record1"), "response1")
         );
 
-        // Write #2.
+        // Complete transaction #1, to force the flush of write #1.
+        CompletableFuture<Void> complete1 = runtime.scheduleTransactionCompletion(
+            "complete#1",
+            TP,
+            100L,
+            (short) 50,
+            10,
+            TransactionResult.COMMIT,
+            DEFAULT_WRITE_TIMEOUT
+        );
+
+        // Write #2 but without any records.
         CompletableFuture<String> write2 = runtime.scheduleWriteOperation("write#2", TP, Duration.ofMillis(20),
-            state -> new CoordinatorResult<>(List.of(records.get(1)), "response2")
-        );
-
-        // Write #3, to force the flush of write #2.
-        CompletableFuture<String> write3 = runtime.scheduleWriteOperation("write#3", TP, Duration.ofMillis(20),
-            state -> new CoordinatorResult<>(List.of(records.get(1)), "response3")
+            state -> new CoordinatorResult<>(List.of(), "response2")
         );
 
         // Records have been written to the log.
         assertEquals(List.of(
-            records(timer.time().milliseconds(), records.get(0)),
-            records(timer.time().milliseconds(), records.get(1))
+            records(timer.time().milliseconds(), "record1"),
+            endTransactionMarker(100L, (short) 50, timer.time().milliseconds(), 10, ControlRecordType.COMMIT)
         ), writer.entries(TP));
 
         // Verify that no writes are committed yet.
         assertFalse(write1.isDone());
+        assertFalse(complete1.isDone());
         assertFalse(write2.isDone());
-        assertFalse(write3.isDone());
 
         // Schedule the unloading.
         runtime.scheduleUnloadOperation(TP, OptionalInt.of(ctx.epoch + 1));
@@ -817,11 +689,11 @@ public class CoordinatorRuntimeTest {
         // All write completions throw exceptions after completing their futures.
         // Despite the exceptions, the unload should still complete.
         assertTrue(write1.isDone());
+        assertTrue(complete1.isDone());
         assertTrue(write2.isDone());
-        assertTrue(write3.isDone());
         assertFutureThrows(NotCoordinatorException.class, write1);
+        assertFutureThrows(NotCoordinatorException.class, complete1);
         assertFutureThrows(NotCoordinatorException.class, write2);
-        assertFutureThrows(NotCoordinatorException.class, write3);
 
         // Verify that onUnloaded is called.
         verify(coordinator, times(1)).onUnloaded();
@@ -2024,11 +1896,11 @@ public class CoordinatorRuntimeTest {
         // Coordinator 0 is loaded. It should get the current image
         // that is the empty one.
         future0.complete(null);
-        verify(coordinator0).onLoaded(MetadataImage.EMPTY);
+        verify(coordinator0).onLoaded(CoordinatorMetadataImage.EMPTY);
 
         // Publish a new image.
-        MetadataDelta delta = new MetadataDelta(MetadataImage.EMPTY);
-        MetadataImage newImage = delta.apply(MetadataProvenance.EMPTY);
+        CoordinatorMetadataDelta delta = new KRaftCoordinatorMetadataDelta(new MetadataDelta(MetadataImage.EMPTY));
+        CoordinatorMetadataImage newImage = CoordinatorMetadataImage.EMPTY;
         runtime.onNewMetadataImage(newImage, delta);
 
         // Coordinator 0 should be notified about it.
@@ -2822,53 +2694,56 @@ public class CoordinatorRuntimeTest {
         // Load the coordinator.
         runtime.scheduleLoadOperation(TP, 10);
 
-        // Get the max batch size.
-        int maxBatchSize = writer.config(TP).maxMessageSize();
-
-        // Create records with three quarters of the max batch size each, so that it is not
-        // possible to have more than one record in a single batch.
-        List<String> records = Stream.of('1', '2', '3').map(c -> {
-            char[] payload = new char[maxBatchSize * 3 / 4];
-            Arrays.fill(payload, c);
-            return new String(payload);
-        }).collect(Collectors.toList());
-
         // Write #1.
         CompletableFuture<String> write1 = runtime.scheduleWriteOperation("write#1", TP, Duration.ofMillis(20),
-            state -> new CoordinatorResult<>(List.of(records.get(0)), "response1")
+            state -> new CoordinatorResult<>(List.of("record1"), "response1")
         );
 
-        // Write #2.
+        // Complete transaction #1, to force the flush of write #2.
+        CompletableFuture<Void> complete1 = runtime.scheduleTransactionCompletion(
+            "complete#1",
+            TP,
+            100L,
+            (short) 50,
+            10,
+            TransactionResult.COMMIT,
+            DEFAULT_WRITE_TIMEOUT
+        );
+
+        // Write #2 but without any records.
         CompletableFuture<String> write2 = runtime.scheduleWriteOperation("write#2", TP, Duration.ofMillis(20),
-            state -> new CoordinatorResult<>(List.of(records.get(1)), "response2")
+            state -> new CoordinatorResult<>(List.of(), "response2")
         );
 
-        // Write #3, to force the flush of write #2.
+        // Write #3, also without any records. Should complete together with write #2.
         CompletableFuture<String> write3 = runtime.scheduleWriteOperation("write#3", TP, Duration.ofMillis(20),
-            state -> new CoordinatorResult<>(List.of(records.get(1)), "response3")
+            state -> new CoordinatorResult<>(List.of(), "response3")
         );
 
         // Records have been written to the log.
         assertEquals(List.of(
-            records(timer.time().milliseconds(), records.get(0)),
-            records(timer.time().milliseconds(), records.get(1))
+            records(timer.time().milliseconds(), "record1"),
+            endTransactionMarker(100L, (short) 50, timer.time().milliseconds(), 10, ControlRecordType.COMMIT)
         ), writer.entries(TP));
 
         // Verify that no writes are committed yet.
         assertFalse(write1.isDone());
+        assertFalse(complete1.isDone());
         assertFalse(write2.isDone());
         assertFalse(write3.isDone());
 
-        // Commit the first and second record.
+        // Commit the records and transaction marker.
         writer.commit(TP, 2);
 
-        // Write #1 and write #2's completions throw exceptions after completing their futures.
-        // Despite the exception from write #1, write #2 should still be completed.
+        // All write completions throw exceptions after completing their futures.
+        // Despite the exceptions, all writes should still complete.
         assertTrue(write1.isDone());
+        assertTrue(complete1.isDone());
         assertTrue(write2.isDone());
-        assertFalse(write3.isDone());
+        assertTrue(write3.isDone());
         assertEquals("response1", write1.get(5, TimeUnit.SECONDS));
         assertEquals("response2", write2.get(5, TimeUnit.SECONDS));
+        assertEquals("response3", write3.get(5, TimeUnit.SECONDS));
     }
 
     @Test
@@ -2941,9 +2816,8 @@ public class CoordinatorRuntimeTest {
         assertTrue(write1.isDone());
         assertTrue(write2.isDone());
 
-        // All timer tasks have been cancelled. TimerTask entries are not removed in MockTimer.
-        assertEquals(2, timer.size());
-        timer.taskQueue().forEach(taskEntry -> assertTrue(taskEntry.cancelled()));
+        // All timer tasks have been cancelled. Hence,they have been removed in MockTimer.
+        assertEquals(0, timer.size());
     }
 
     @Test
@@ -3011,9 +2885,8 @@ public class CoordinatorRuntimeTest {
         assertEquals(1, runtime.contextOrThrow(TP).coordinator.lastCommittedOffset());
         assertTrue(write1.isDone());
 
-        // All timer tasks have been cancelled. TimerTask entries are not removed in MockTimer.
-        assertEquals(1, timer.size());
-        timer.taskQueue().forEach(taskEntry -> assertTrue(taskEntry.cancelled()));
+        // All timer tasks have been cancelled. Hence, they have been removed in MockTimer.
+        assertEquals(0, timer.size());
     }
 
     @Test
@@ -3047,11 +2920,11 @@ public class CoordinatorRuntimeTest {
         assertEquals(List.of(0L), ctx.coordinator.snapshotRegistry().epochsList());
 
         int maxBatchSize = writer.config(TP).maxMessageSize();
-        assertTrue(maxBatchSize > MIN_BUFFER_SIZE);
+        assertTrue(maxBatchSize > INITIAL_BUFFER_SIZE);
 
-        // Generate enough records to create a batch that has 16KB < batchSize < maxBatchSize
+        // Generate enough records to create a batch that has INITIAL_BUFFER_SIZE < batchSize < maxBatchSize
         List<String> records = new ArrayList<>();
-        for (int i = 0; i < 3000; i++) {
+        for (int i = 0; i < 50000; i++) {
             records.add("record-" + i);
         }
 
@@ -3065,7 +2938,210 @@ public class CoordinatorRuntimeTest {
         assertFalse(write1.isCompletedExceptionally());
 
         int batchSize = writer.entries(TP).get(0).sizeInBytes();
-        assertTrue(batchSize > MIN_BUFFER_SIZE && batchSize < maxBatchSize);
+        assertTrue(batchSize > INITIAL_BUFFER_SIZE && batchSize < maxBatchSize);
+    }
+
+    @Test
+    public void testCoordinatorDoNotRetainBufferLargeThanMaxMessageSize() {
+        MockTimer timer = new MockTimer();
+        InMemoryPartitionWriter mockWriter = new InMemoryPartitionWriter(false) {
+            @Override
+            public LogConfig config(TopicPartition tp) {
+                return new LogConfig(Map.of(
+                    TopicConfig.MAX_MESSAGE_BYTES_CONFIG, String.valueOf(1024 * 1024) // 1MB
+                ));
+            }
+        };
+        StringSerializer serializer = new StringSerializer();
+
+        CoordinatorRuntime<MockCoordinatorShard, String> runtime =
+            new CoordinatorRuntime.Builder<MockCoordinatorShard, String>()
+                .withTime(timer.time())
+                .withTimer(timer)
+                .withDefaultWriteTimeOut(DEFAULT_WRITE_TIMEOUT)
+                .withLoader(new MockCoordinatorLoader())
+                .withEventProcessor(new DirectEventProcessor())
+                .withPartitionWriter(mockWriter)
+                .withCoordinatorShardBuilderSupplier(new MockCoordinatorShardBuilderSupplier())
+                .withCoordinatorRuntimeMetrics(mock(CoordinatorRuntimeMetrics.class))
+                .withCoordinatorMetrics(mock(CoordinatorMetrics.class))
+                .withSerializer(serializer)
+                .withExecutorService(mock(ExecutorService.class))
+                .build();
+
+        // Schedule the loading.
+        runtime.scheduleLoadOperation(TP, 10);
+
+        // Verify the initial state.
+        CoordinatorRuntime<MockCoordinatorShard, String>.CoordinatorContext ctx = runtime.contextOrThrow(TP);
+        assertEquals(0L, ctx.coordinator.lastWrittenOffset());
+        assertEquals(0L, ctx.coordinator.lastCommittedOffset());
+        assertEquals(List.of(0L), ctx.coordinator.snapshotRegistry().epochsList());
+
+        // Generate a record larger than the maxBatchSize.
+        List<String> largeRecords = List.of("A".repeat(100 * 1024 * 1024));
+
+        // Write #1.
+        CompletableFuture<String> write1 = runtime.scheduleWriteOperation("write#1", TP, DEFAULT_WRITE_TIMEOUT,
+            state -> new CoordinatorResult<>(largeRecords, "response1", null, true, false)
+        );
+
+        // Verify that the write has not completed exceptionally.
+        // This will catch any exceptions thrown including RecordTooLargeException.
+        assertFalse(write1.isCompletedExceptionally());
+
+        // Verify that the next buffer retrieved from the bufferSupplier is the initial small one, not the large buffer.
+        assertEquals(INITIAL_BUFFER_SIZE, ctx.bufferSupplier.get(1).capacity());
+    }
+
+    @Test
+    public void testCoordinatorRetainExpandedBufferLessOrEqualToMaxMessageSize() {
+        MockTimer timer = new MockTimer();
+        InMemoryPartitionWriter mockWriter = new InMemoryPartitionWriter(false) {
+            @Override
+            public LogConfig config(TopicPartition tp) {
+                return new LogConfig(Map.of(
+                    TopicConfig.MAX_MESSAGE_BYTES_CONFIG, String.valueOf(1024 * 1024 * 1024) // 1GB
+                ));
+            }
+        };
+        StringSerializer serializer = new StringSerializer();
+
+        CoordinatorRuntime<MockCoordinatorShard, String> runtime =
+            new CoordinatorRuntime.Builder<MockCoordinatorShard, String>()
+                .withTime(timer.time())
+                .withTimer(timer)
+                .withDefaultWriteTimeOut(DEFAULT_WRITE_TIMEOUT)
+                .withLoader(new MockCoordinatorLoader())
+                .withEventProcessor(new DirectEventProcessor())
+                .withPartitionWriter(mockWriter)
+                .withCoordinatorShardBuilderSupplier(new MockCoordinatorShardBuilderSupplier())
+                .withCoordinatorRuntimeMetrics(mock(CoordinatorRuntimeMetrics.class))
+                .withCoordinatorMetrics(mock(CoordinatorMetrics.class))
+                .withSerializer(serializer)
+                .withExecutorService(mock(ExecutorService.class))
+                .build();
+
+        // Schedule the loading.
+        runtime.scheduleLoadOperation(TP, 10);
+
+        // Verify the initial state.
+        CoordinatorRuntime<MockCoordinatorShard, String>.CoordinatorContext ctx = runtime.contextOrThrow(TP);
+        assertEquals(0L, ctx.coordinator.lastWrittenOffset());
+        assertEquals(0L, ctx.coordinator.lastCommittedOffset());
+        assertEquals(List.of(0L), ctx.coordinator.snapshotRegistry().epochsList());
+
+        // Generate enough records to create a batch that has INITIAL_BUFFER_SIZE < batchSize < maxBatchSize
+        List<String> records = new ArrayList<>();
+        for (int i = 0; i < 1000000; i++) {
+            records.add("record-" + i);
+        }
+
+        // Write #1.
+        CompletableFuture<String> write1 = runtime.scheduleWriteOperation("write#1", TP, DEFAULT_WRITE_TIMEOUT,
+            state -> new CoordinatorResult<>(records, "response1")
+        );
+
+        // Verify that the write has not completed exceptionally.
+        // This will catch any exceptions thrown including RecordTooLargeException.
+        assertFalse(write1.isCompletedExceptionally());
+
+        int batchSize = mockWriter.entries(TP).get(0).sizeInBytes();
+        int maxBatchSize = mockWriter.config(TP).maxMessageSize();
+        assertTrue(INITIAL_BUFFER_SIZE < batchSize && batchSize <= maxBatchSize);
+
+        // Verify that the next buffer retrieved from the bufferSupplier is the expanded buffer.
+        assertTrue(ctx.bufferSupplier.get(1).capacity() > INITIAL_BUFFER_SIZE);
+    }
+
+    @Test
+    public void testBufferShrinkWhenMaxMessageSizeReducedBelowInitialBufferSize() {
+        MockTimer timer = new MockTimer();
+        var mockWriter = new InMemoryPartitionWriter(false) {
+            private LogConfig config = new LogConfig(Map.of(
+                TopicConfig.MAX_MESSAGE_BYTES_CONFIG, String.valueOf(1024 * 1024) // 1MB
+            ));
+
+            @Override
+            public LogConfig config(TopicPartition tp) {
+                return config;
+            }
+
+            public void updateConfig(LogConfig newConfig) {
+                this.config = newConfig;
+            }
+        };
+        StringSerializer serializer = new StringSerializer();
+
+        CoordinatorRuntime<MockCoordinatorShard, String> runtime =
+            new CoordinatorRuntime.Builder<MockCoordinatorShard, String>()
+                .withTime(timer.time())
+                .withTimer(timer)
+                .withDefaultWriteTimeOut(DEFAULT_WRITE_TIMEOUT)
+                .withLoader(new MockCoordinatorLoader())
+                .withEventProcessor(new DirectEventProcessor())
+                .withPartitionWriter(mockWriter)
+                .withCoordinatorShardBuilderSupplier(new MockCoordinatorShardBuilderSupplier())
+                .withCoordinatorRuntimeMetrics(mock(CoordinatorRuntimeMetrics.class))
+                .withCoordinatorMetrics(mock(CoordinatorMetrics.class))
+                .withSerializer(serializer)
+                .withExecutorService(mock(ExecutorService.class))
+                .build();
+
+        // Schedule the loading.
+        runtime.scheduleLoadOperation(TP, 10);
+
+        // Verify the initial state.
+        CoordinatorRuntime<MockCoordinatorShard, String>.CoordinatorContext ctx = runtime.contextOrThrow(TP);
+        assertEquals(0L, ctx.coordinator.lastWrittenOffset());
+        assertEquals(0L, ctx.coordinator.lastCommittedOffset());
+        assertEquals(List.of(0L), ctx.coordinator.snapshotRegistry().epochsList());
+
+        List<String> records = new ArrayList<>();
+        for (int i = 0; i < 1000; i++) {
+            records.add("record-" + i);
+        }
+
+        // Write #1.
+        CompletableFuture<String> write1 = runtime.scheduleWriteOperation("write#1", TP, DEFAULT_WRITE_TIMEOUT,
+            state -> new CoordinatorResult<>(records, "response1")
+        );
+
+        // Verify that the write has not completed exceptionally.
+        // This will catch any exceptions thrown including RecordTooLargeException.
+        assertFalse(write1.isCompletedExceptionally());
+
+        int batchSize = mockWriter.entries(TP).get(0).sizeInBytes();
+        int maxBatchSize = mockWriter.config(TP).maxMessageSize();
+        assertTrue(batchSize <= INITIAL_BUFFER_SIZE && INITIAL_BUFFER_SIZE <= maxBatchSize);
+
+        ByteBuffer cachedBuffer = ctx.bufferSupplier.get(1);
+        assertEquals(INITIAL_BUFFER_SIZE, cachedBuffer.capacity());
+        // ctx.bufferSupplier.get(1); will clear cachedBuffer in bufferSupplier. Use release to put it back to bufferSupplier
+        ctx.bufferSupplier.release(cachedBuffer);
+
+        // Reduce max message size below initial buffer size.
+        mockWriter.updateConfig(new LogConfig(
+            Map.of(TopicConfig.MAX_MESSAGE_BYTES_CONFIG, String.valueOf(INITIAL_BUFFER_SIZE - 66))));
+        assertEquals(INITIAL_BUFFER_SIZE - 66, mockWriter.config(TP).maxMessageSize());
+
+        // Write #2.
+        CompletableFuture<String> write2 = runtime.scheduleWriteOperation("write#2", TP, DEFAULT_WRITE_TIMEOUT,
+            state -> new CoordinatorResult<>(records, "response2")
+        );
+        assertFalse(write2.isCompletedExceptionally());
+
+        // Verify that there is no cached buffer since the cached buffer size is greater than new maxMessageSize.
+        assertEquals(1, ctx.bufferSupplier.get(1).capacity());
+
+        // Write #3.
+        CompletableFuture<String> write3 = runtime.scheduleWriteOperation("write#3", TP, DEFAULT_WRITE_TIMEOUT,
+            state -> new CoordinatorResult<>(records, "response3")
+        );
+        assertFalse(write3.isCompletedExceptionally());
+
+        // Verify that the cached buffer size is equals to new maxMessageSize that less than INITIAL_BUFFER_SIZE.
+        assertEquals(mockWriter.config(TP).maxMessageSize(), ctx.bufferSupplier.get(1).capacity());
     }
 
     @Test

@@ -624,8 +624,52 @@ class ReplicaManager(val config: KafkaConfig,
   def addToActionQueue(action: Runnable): Unit = defaultActionQueue.add(action)
 
   /**
-   * Why `appendRecords` is in ReplicaManager?
+   * jb: Why `appendRecords` is in ReplicaManager?
    *
+   * Append messages to leader replicas of the partition, without waiting on replication.
+   *
+   * Noted that all pending delayed check operations are stored in a queue. All callers to ReplicaManager.appendRecordsToLeader()
+   * are expected to call ActionQueue.tryCompleteActions for all affected partitions, without holding any conflicting
+   * locks.
+   *
+   * @param requiredAcks                  the required acks -- it is only used to ensure that the append meets the
+   *                                      required acks.
+   * @param internalTopicsAllowed         boolean indicating whether internal topics can be appended to
+   * @param origin                        source of the append request (ie, client, replication, coordinator)
+   * @param entriesPerPartition           the records per topic partition to be appended.
+   *                                      If topic partition contains Uuid.ZERO_UUID as topicId the method
+   *                                      will fall back to the old behaviour and rely on topic name.
+   * @param requestLocal                  container for the stateful instances scoped to this request -- this must correspond to the
+   *                                      thread calling this method
+   * @param actionQueue                   the action queue to use. ReplicaManager#defaultActionQueue is used by default.
+   * @param verificationGuards            the mapping from topic partition to verification guards if transaction verification is used
+   */
+  def appendRecordsToLeader(
+    requiredAcks: Short,
+    internalTopicsAllowed: Boolean,
+    origin: AppendOrigin,
+    entriesPerPartition: Map[TopicIdPartition, MemoryRecords],
+    requestLocal: RequestLocal = RequestLocal.noCaching,
+    actionQueue: ActionQueue = this.defaultActionQueue,
+    verificationGuards: Map[TopicPartition, VerificationGuard] = Map.empty
+  ): Map[TopicIdPartition, LogAppendResult] = {
+    val startTimeMs = time.milliseconds
+    val localProduceResultsWithTopicId = appendToLocalLog(
+      internalTopicsAllowed = internalTopicsAllowed,
+      origin,
+      entriesPerPartition,
+      requiredAcks,
+      requestLocal,
+      verificationGuards.toMap
+    )
+    debug("Produce to local log in %d ms".format(time.milliseconds - startTimeMs))
+
+    addCompletePurgatoryAction(actionQueue, localProduceResultsWithTopicId)
+
+    localProduceResultsWithTopicId
+  }
+
+  /**
    * Append messages to leader replicas of the partition, and wait for them to be replicated to other replicas;
    * the callback function will be triggered either when timeout or the required acks are satisfied;
    * if the callback function itself is already synchronized on some object then pass this object to avoid deadlock.
@@ -842,10 +886,10 @@ class ReplicaManager(val config: KafkaConfig,
   }
 
   private def buildProducePartitionStatus(
-    results: Map[TopicPartition, LogAppendResult]
-  ): Map[TopicPartition, ProducePartitionStatus] = {
-    results.map { case (topicPartition, result) =>
-      topicPartition -> ProducePartitionStatus(
+    results: Map[TopicIdPartition, LogAppendResult]
+  ): Map[TopicIdPartition, ProducePartitionStatus] = {
+    results.map { case (topicIdPartition, result) =>
+      topicIdPartition -> ProducePartitionStatus(
         result.info.lastOffset + 1, // required offset -> what is required offset ?
         new PartitionResponse(
           result.error,

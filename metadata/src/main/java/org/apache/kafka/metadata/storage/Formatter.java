@@ -347,15 +347,22 @@ public class Formatter {
         if (configuredKRaftVersionLevel.isPresent()) {
             if (configuredKRaftVersionLevel.get() == 0) {
                 if (hasDynamicQuorum()) {
-                    throw new FormatterException("Cannot set kraft.version to " +
-                        configuredKRaftVersionLevel.get() + " if KIP-853 configuration is present. " +
-                            "Try removing the --feature flag for kraft.version.");
+                    throw new FormatterException(
+                        "Cannot set kraft.version to " +
+                        configuredKRaftVersionLevel.get() +
+                        " if one of the flags --standalone, --initial-controllers, or --no-initial-controllers is used. " +
+                        "For dynamic controllers support, try removing the --feature flag for kraft.version."
+                    );
                 }
             } else {
                 if (!hasDynamicQuorum()) {
-                    throw new FormatterException("Cannot set kraft.version to " +
-                        configuredKRaftVersionLevel.get() + " unless KIP-853 configuration is present. " +
-                            "Try removing the --feature flag for kraft.version.");
+                    throw new FormatterException(
+                        "Cannot set kraft.version to " +
+                        configuredKRaftVersionLevel.get() +
+                        " unless one of the flags --standalone, --initial-controllers, or --no-initial-controllers is used. " +
+                        "For dynamic controllers support, try using one of --standalone, --initial-controllers, or " +
+                        "--no-initial-controllers."
+                    );
                 }
             }
             return configuredKRaftVersionLevel.get();
@@ -408,6 +415,7 @@ public class Formatter {
         if (ensemble.emptyLogDirs().isEmpty()) {
             printStream.println("All of the log directories are already formatted.");
         } else {
+            printStream.println("Bootstrap metadata: " + bootstrapMetadata);
             Map<String, DirectoryType> directoryTypes = new HashMap<>();
             for (String emptyLogDir : ensemble.emptyLogDirs()) {
                 DirectoryType directoryType = DirectoryType.calculate(emptyLogDir,
@@ -454,17 +462,12 @@ public class Formatter {
         DYNAMIC_METADATA_VOTER_DIRECTORY;
 
         String description() {
-            switch (this) {
-                case LOG_DIRECTORY:
-                    return "data directory";
-                case STATIC_METADATA_DIRECTORY:
-                    return "metadata directory";
-                case DYNAMIC_METADATA_NON_VOTER_DIRECTORY:
-                    return "dynamic metadata directory";
-                case DYNAMIC_METADATA_VOTER_DIRECTORY:
-                    return "dynamic metadata voter directory";
-            }
-            throw new RuntimeException("invalid enum type " + this);
+            return switch (this) {
+                case LOG_DIRECTORY -> "data directory";
+                case STATIC_METADATA_DIRECTORY -> "metadata directory";
+                case DYNAMIC_METADATA_NON_VOTER_DIRECTORY -> "dynamic metadata directory";
+                case DYNAMIC_METADATA_VOTER_DIRECTORY -> "dynamic metadata voter directory";
+            };
         }
 
         boolean isDynamicMetadataDirectory() {
@@ -503,7 +506,7 @@ public class Formatter {
         VoterSet voterSet = initialControllers.toVoterSet(controllerListenerName);
         RecordsSnapshotWriter.Builder builder = new RecordsSnapshotWriter.Builder().
             setLastContainedLogTimestamp(Time.SYSTEM.milliseconds()).
-            setMaxBatchSize(KafkaRaftClient.MAX_BATCH_SIZE_BYTES).
+            setMaxBatchSizeBytes(KafkaRaftClient.MAX_BATCH_SIZE_BYTES).
             setRawSnapshotWriter(FileRawSnapshotWriter.create(
                 clusterMetadataDirectory.toPath(),
                 Snapshots.BOOTSTRAP_SNAPSHOT_ID)).
