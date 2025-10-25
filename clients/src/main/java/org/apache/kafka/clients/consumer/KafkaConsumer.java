@@ -72,12 +72,15 @@ import static org.apache.kafka.common.utils.Utils.propsToMap;
  * Kafka maintains a numerical offset for each record in a partition. This offset acts as a unique identifier of
  * a record within that partition, and also denotes the position of the consumer in the partition. For example, a consumer
  * which is at position 5 has consumed records with offsets 0 through 4 and will next receive the record with offset 5.
+ *
+ * jb: 오호 offsets are not guaranteed to be consecutive. compacted topic?
  * Note that offsets are not guaranteed to be consecutive (such as compacted topic or when records have been produced
  * using transactions). For example, if the consumer did read a record with offset 4, but 5 is not an offset
  * with a record, its position might advance to 6 (or higher) directly. Similarly, if the consumer's position is 5,
  * but there is no record with offset 5, the consumer will return the record with the next higher offset.
  * There are actually two notions of position relevant to the user of the consumer:
  * <p>
+ * jb: position 이라는 개념이 있네
  * The {@link #position(TopicPartition) position} of the consumer gives the offset of the next record that will be given
  * out. It will be one larger than the highest offset the consumer has seen in that partition. It automatically advances
  * every time the consumer receives messages in a call to {@link #poll(Duration)}.
@@ -107,6 +110,7 @@ import static org.apache.kafka.common.utils.Utils.propsToMap;
  * be reassigned to other consumers in the same group. Similarly, if a new consumer joins the group, partitions will be moved
  * from existing consumers to the new one. This is known as <i>rebalancing</i> the group and is discussed in more
  * detail <a href="#failuredetection">below</a>. Group rebalancing is also used when new partitions are added
+ * jb: new topic matching이 뭘 말하는건지?
  * to one of the subscribed topics or when a new topic matching a {@link #subscribe(Pattern, ConsumerRebalanceListener) subscribed regex}
  * is created. The group will automatically detect the new partitions through periodic metadata refreshes and
  * assign them to members of the group.
@@ -125,6 +129,7 @@ import static org.apache.kafka.common.utils.Utils.propsToMap;
  * which allows them to finish necessary application-level logic such as state cleanup, manual offset
  * commits, etc. See <a href="#rebalancecallback">Storing Offsets Outside Kafka</a> for more details.
  * <p>
+ * // manual assign이 가능한가봄? (jb)
  * It is also possible for the consumer to <a href="#manualassignment">manually assign</a> specific partitions
  * (similar to the older "simple" consumer) using {@link #assign(Collection)}. In this case, dynamic partition
  * assignment and consumer group coordination will be disabled.
@@ -138,6 +143,9 @@ import static org.apache.kafka.common.utils.Utils.propsToMap;
  * a duration of {@code session.timeout.ms}, then the consumer will be considered dead and its partitions will
  * be reassigned.
  * <p>
+ *
+ * 아래를 보면 session.timeout.ms 와 max.poll.interval.ms랑 별개로 failure detection 하는걸 알 수 있음 (jb)
+ *
  * It is also possible that the consumer could encounter a "livelock" situation where it is continuing
  * to send heartbeats, but no progress is being made. To prevent the consumer from holding onto its partitions
  * indefinitely in this case, we provide a liveness detection mechanism using the {@code max.poll.interval.ms}
@@ -148,6 +156,8 @@ import static org.apache.kafka.common.utils.Utils.propsToMap;
  * So to stay in the group, you must continue to call poll.
  * <p>
  * The consumer provides two configuration settings to control the behavior of the poll loop:
+ *
+ * max.poll.interval.ms, max.poll.records 설명과 trade-off. (jb)
  * <ol>
  *     <li><code>max.poll.interval.ms</code>: By increasing the interval between expected polls, you can give
  *     the consumer more time to handle a batch of records returned from {@link #poll(Duration)}. The drawback
@@ -166,6 +176,8 @@ import static org.apache.kafka.common.utils.Utils.propsToMap;
  * Some care must be taken to ensure that committed offsets do not get ahead of the actual position.
  * Typically, you must disable automatic commits and manually commit processed offsets for records only after the
  * thread has finished handling them (depending on the delivery semantics you need).
+ *
+ * max.poll.interval.ms 동안 poll 못할 것 같으면 pause 도 방법. 아니면 poll 해놓고 처리안하고 다 버리는건 어떨지? (jb)
  * Note also that you will need to {@link #pause(Collection) pause} the partition so that no new records are received
  * from poll until after thread has finished handling those previously returned.
  *
@@ -260,7 +272,7 @@ import static org.apache.kafka.common.utils.Utils.propsToMap;
  * <p>
  * The above example uses {@link #commitSync() commitSync} to mark all received records as committed. In some cases
  * you may wish to have even finer control over which records have been committed by specifying an offset explicitly.
- * In the example below we commit offset after we finish handling the records in each partition.
+ * In the example below we commit offset after we finish han
  * <p>
  * <pre>
  *     try {
@@ -272,7 +284,7 @@ import static org.apache.kafka.common.utils.Utils.propsToMap;
  *                     System.out.println(record.offset() + &quot;: &quot; + record.value());
  *                 }
  *                 consumer.commitSync(Collections.singletonMap(partition, records.nextOffsets().get(partition)));
- *             }
+ *
  *         }
  *     } finally {
  *       consumer.close();
@@ -300,6 +312,11 @@ import static org.apache.kafka.common.utils.Utils.propsToMap;
  * will be restarted on another machine.
  * </ul>
  * <p>
+ *
+ * produce 시에 특정 파티션 consume 할 수 있는 것 처럼, 특정 파티션 assign도 가능 한가봄?
+ * 그럼 poll 당겼을 때 revoke나 다른 consuemr failed 감지되는건 어찌하는 건지?
+ * -> assign 주석 보면 답 나옴. consumer management 기능을 안쓰는 거임. 같이 쓰는 것도 불가. poll 시 감지나 리벨런스 트리거도 안될듯
+ *
  * To use this mode, instead of subscribing to the topic using {@link #subscribe(Collection) subscribe}, you just call
  * {@link #assign(Collection)} with the full list of partitions that you want to consume.
  *
@@ -322,6 +339,7 @@ import static org.apache.kafka.common.utils.Utils.propsToMap;
  *
  * <h4><a name="rebalancecallback">Storing Offsets Outside Kafka</h4>
  *
+ * offset + result를 직접 atomic 하게 저장하면 exactly-once 효과를 누릴 수 있다.
  * The consumer application need not use Kafka's built-in offset storage, it can store offsets in a store of its own
  * choosing. The primary use case for this is allowing the application to store both the offset and the results of the
  * consumption in the same system in a way that both the results and offsets are stored atomically. This is not always
@@ -940,6 +958,8 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      * @throws org.apache.kafka.common.errors.FencedInstanceIdException if this consumer is using the classic group protocol
      *            and this instance gets fenced by broker.
      */
+
+    //  the last offset that has been stored securely.
     @Override
     public void commitSync() {
         delegate.commitSync();
@@ -1267,6 +1287,8 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      * @throws org.apache.kafka.common.errors.TimeoutException if the position cannot be determined before the
      *             timeout specified by {@code default.api.timeout.ms} expires
      */
+
+    // jb: 윗 주석에서 가져옴: The {@link #position(TopicPartition) position} of the consumer gives the offset of the next record that will be given out.
     @Override
     public long position(TopicPartition partition) {
         return delegate.position(partition);

@@ -401,6 +401,7 @@ public class CommitRequestManager implements RequestManager, MemberStateListener
         CompletableFuture<Map<TopicPartition, OffsetAndMetadata>> asyncCommitResult = new CompletableFuture<>();
         commitRequest.future.whenComplete((committedOffsets, error) -> {
             if (error != null) {
+                // 회사에서 여기서 에러 났음 (jb) - 여기 코드의 문제가 아니라 외부 여길 호출하는 쪽을 봐야하는 것으로 결론.
                 asyncCommitResult.completeExceptionally(commitAsyncExceptionForError(error));
             } else {
                 asyncCommitResult.complete(offsets);
