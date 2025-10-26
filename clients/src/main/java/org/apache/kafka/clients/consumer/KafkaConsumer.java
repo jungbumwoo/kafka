@@ -272,7 +272,7 @@ import static org.apache.kafka.common.utils.Utils.propsToMap;
  * <p>
  * The above example uses {@link #commitSync() commitSync} to mark all received records as committed. In some cases
  * you may wish to have even finer control over which records have been committed by specifying an offset explicitly.
- * In the example below we commit offset after we finish han
+ * In the example below we commit offset after we finish handling the records in each partition.
  * <p>
  * <pre>
  *     try {
@@ -284,7 +284,7 @@ import static org.apache.kafka.common.utils.Utils.propsToMap;
  *                     System.out.println(record.offset() + &quot;: &quot; + record.value());
  *                 }
  *                 consumer.commitSync(Collections.singletonMap(partition, records.nextOffsets().get(partition)));
- *
+ *             }
  *         }
  *     } finally {
  *       consumer.close();
