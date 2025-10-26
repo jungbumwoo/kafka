@@ -264,7 +264,7 @@ public class ProducerConfig extends AbstractConfig {
 
     // max.in.flight.requests.per.connection should be less than or equal to 5 when idempotence producer enabled to ensure message ordering
     // The value 5 is aligned with ProducerStateEntry#NUM_BATCHES_TO_RETAIN.
-    private static final int MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION_FOR_IDEMPOTENCE = 5;
+    private static final int MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION_FOR_IDEMPOTENCE = 5; // (jb) #2735 처음 구현 당시에는 1 이었는데 5로 늘려줬나봄. 5개까지 순서보장해줄 버퍼가 있을 것 같아서 나중에 찾아봐야지
 
     /** <code>max.in.flight.requests.per.connection</code> */
     public static final String MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION = "max.in.flight.requests.per.connection";
@@ -334,6 +334,18 @@ public class ProducerConfig extends AbstractConfig {
                                                         + "Implementing the <code>org.apache.kafka.clients.producer.ProducerInterceptor</code> interface allows you to intercept (and possibly mutate) the records "
                                                         + "received by the producer before they are published to the Kafka cluster. By default, there are no interceptors.";
 
+    /*
+    * (jb) idempotence
+    *
+    * 아래 내용으로 리뷰가 오갔는데, 결국 idempotence 쓰면 acks == all 로 사용됨. 관련 코드는 아직 못찾음
+    * acks = 1이라고 했을 때, 반영되었는데 leader change로 acks를 못받는 경우, producer는 그 지점에서 계속 재시도 할테고, broker는 이미 다음 sequence 가 아니면
+    * 에러 줄거라 그런듯 함 (추측)
+    *
+    * https://github.com/apache/kafka/pull/2735/files
+    * Similar to this, it seems the default acks=1 doesn't make sense when idempotence is enabled.
+    * This is because with acks=1, acked messages could be lost during leader change.
+    * Then, the producer will be out of sequence. Perhaps if idempotence is enabled, we should enforce acks=all.
+    * */
     /** <code>enable.idempotence</code> */
     public static final String ENABLE_IDEMPOTENCE_CONFIG = "enable.idempotence";
     public static final String ENABLE_IDEMPOTENCE_DOC = "When set to 'true', the producer will ensure that exactly one copy of each message is written in the stream. If 'false', producer "
