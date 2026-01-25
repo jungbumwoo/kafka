@@ -972,6 +972,13 @@ public class CommitRequestManager implements RequestManager, MemberStateListener
         public final Set<TopicPartition> requestedPartitions;
 
         /**
+         * Map of topic ID to topic names for the topics included in a request when using topic IDs.
+         * To be used when parsing the response, as topics may be removed from the consumer
+         * metadata before receiving a response.
+         */
+        public Map<Uuid, String> topicNamesCache;
+
+        /**
          * Future with the result of the request. This can be reset using {@link #resetFuture()}
          * to get a new result when the request is retried.
          */
@@ -986,6 +993,7 @@ public class CommitRequestManager implements RequestManager, MemberStateListener
                 retryBackoffMaxMs, memberInfo, deadlineTimer(time, deadlineMs));
             this.requestedPartitions = partitions;
             this.future = new CompletableFuture<>();
+            this.topicNamesCache = new HashMap<>();
         }
 
         public OffsetFetchRequestState(final Set<TopicPartition> partitions,
@@ -998,6 +1006,7 @@ public class CommitRequestManager implements RequestManager, MemberStateListener
                 retryBackoffMaxMs, jitter, memberInfo, deadlineTimer(time, deadlineMs));
             this.requestedPartitions = partitions;
             this.future = new CompletableFuture<>();
+            this.topicNamesCache = new HashMap<>();
         }
 
         public boolean sameRequest(final OffsetFetchRequestState request) {
@@ -1006,6 +1015,7 @@ public class CommitRequestManager implements RequestManager, MemberStateListener
 
         public NetworkClientDelegate.UnsentRequest toUnsentRequest() {
             Map<String, Uuid> topicIds = metadata.topicIds();
+            topicNamesCache.clear();
             boolean canUseTopicIds = true;
             List<OffsetFetchRequestData.OffsetFetchRequestTopics> topics = new ArrayList<>();
             Map<String, List<TopicPartition>> tps = requestedPartitions.stream().collect(Collectors.groupingBy(TopicPartition::topic));
@@ -1014,9 +1024,12 @@ public class CommitRequestManager implements RequestManager, MemberStateListener
                 Uuid topicId = topicIds.getOrDefault(topic, Uuid.ZERO_UUID);
                 if (Uuid.ZERO_UUID.equals(topicId)) {
                     canUseTopicIds = false;
+                } else {
+                    // Save topicId-topicName ref to be used when parsing the response
+                    topicNamesCache.put(topicId, topic);
                 }
                 topics.add(new OffsetFetchRequestData.OffsetFetchRequestTopics()
-                    .setName(entry.getKey())
+                    .setName(topic)
                     .setTopicId(topicId)
                     .setPartitionIndexes(entry.getValue().stream()
                         .map(TopicPartition::partition)
@@ -1125,26 +1138,22 @@ public class CommitRequestManager implements RequestManager, MemberStateListener
 
             for (var topic : response.topics()) {
                 // If the topic id is used, the topic name is empty in the response.
-                String topicName = topic.name().isEmpty() ? metadata.topicNames().get(topic.topicId()) : topic.name();
+                String topicName = Uuid.ZERO_UUID.equals(topic.topicId()) ? topic.name() : topicNamesCache.get(topic.topicId());
                 for (var partition : topic.partitions()) {
                     var tp = new TopicPartition(
                         topicName,
                         partition.partitionIndex()
                     );
                     var error = Errors.forCode(partition.errorCode());
-                    if (error != Errors.NONE || topicName == null) {
-                        if (error != Errors.NONE) {
-                            log.debug("Failed to fetch offset for partition {}: {}", tp, error.message());
-                        } else { // unknown topic name
-                            log.debug("Failed to fetch offset, topic does not exist");
-                        }
+                    if (error != Errors.NONE) {
+                        log.debug("Failed to fetch offset for partition {}: {}", tp, error.message());
 
                         if (!failedRequestRegistered) {
                             onFailedAttempt(currentTimeMs);
                             failedRequestRegistered = true;
                         }
 
-                        if (error == Errors.UNKNOWN_TOPIC_OR_PARTITION || error == Errors.UNKNOWN_TOPIC_ID || topicName == null) {
+                        if (error == Errors.UNKNOWN_TOPIC_OR_PARTITION || error == Errors.UNKNOWN_TOPIC_ID) {
                             future.completeExceptionally(new KafkaException("Topic does not exist"));
                             return;
                         } else if (error == Errors.TOPIC_AUTHORIZATION_FAILED) {
@@ -1211,10 +1220,11 @@ public class CommitRequestManager implements RequestManager, MemberStateListener
 
     /**
      * <p>This is used to stage the unsent {@link OffsetCommitRequestState} and {@link OffsetFetchRequestState}.
-     * <li>unsentOffsetCommits holds the offset commit requests that have not been sent out</>
-     * <li>unsentOffsetFetches holds the offset fetch requests that have not been sent out</li>
-     * <li>inflightOffsetFetches holds the offset fetch requests that have been sent out but not completed</>.
-     * <p>
+     * <ul>
+     *   <li>unsentOffsetCommits holds the offset commit requests that have not been sent out</li>
+     *   <li>unsentOffsetFetches holds the offset fetch requests that have not been sent out</li>
+     *   <li>inflightOffsetFetches holds the offset fetch requests that have been sent out but not completed</li>
+     * </ul>
      * {@code addOffsetFetchRequest} dedupes the requests to avoid sending the same requests.
      */
 
