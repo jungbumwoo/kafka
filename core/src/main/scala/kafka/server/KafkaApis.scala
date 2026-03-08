@@ -44,7 +44,7 @@ import org.apache.kafka.common.message._
 import org.apache.kafka.common.metrics.Metrics
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.protocol.{ApiKeys, ApiMessage, Errors}
-import org.apache.kafka.common.record._
+import org.apache.kafka.common.record.internal._
 import org.apache.kafka.common.replica.ClientMetadata
 import org.apache.kafka.common.replica.ClientMetadata.DefaultClientMetadata
 import org.apache.kafka.common.requests.FindCoordinatorRequest.CoordinatorType
@@ -69,7 +69,7 @@ import org.apache.kafka.server.share.{ErroneousAndValidPartitionData, ShareParti
 import org.apache.kafka.server.share.acknowledge.ShareAcknowledgementBatch
 import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, FetchPartitionData}
 import org.apache.kafka.server.transaction.AddPartitionsToTxnManager
-import org.apache.kafka.storage.internals.log.AppendOrigin
+import org.apache.kafka.storage.internals.log.{AppendOrigin, RecordValidationStats}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
 import java.util
@@ -3173,6 +3173,12 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     val groupId = shareFetchRequest.data.groupId
 
+    if (groupId == null) {
+      requestHelper.sendMaybeThrottle(request,
+        shareFetchRequest.getErrorResponse(AbstractResponse.DEFAULT_THROTTLE_TIME, Errors.INVALID_REQUEST.exception("Invalid group id in the request.")))
+      return CompletableFuture.completedFuture[Unit](())
+    }
+
     // Share Fetch needs permission to perform the READ action on the named group resource (groupId)
     if (!authHelper.authorize(request.context, READ, GROUP, groupId)) {
       requestHelper.sendMaybeThrottle(request, shareFetchRequest.getErrorResponse(AbstractResponse.DEFAULT_THROTTLE_TIME, Errors.GROUP_AUTHORIZATION_FAILED.exception))
@@ -3539,6 +3545,12 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     val groupId = shareAcknowledgeRequest.data.groupId
+
+    if (groupId == null) {
+      requestHelper.sendMaybeThrottle(request,
+        shareAcknowledgeRequest.getErrorResponse(AbstractResponse.DEFAULT_THROTTLE_TIME, Errors.INVALID_REQUEST.exception("Invalid group id in the request.")))
+      return CompletableFuture.completedFuture[Unit](())
+    }
 
     // Share Acknowledge needs permission to perform READ action on the named group resource (groupId)
     if (!authHelper.authorize(request.context, READ, GROUP, groupId)) {
@@ -4223,7 +4235,7 @@ class KafkaApis(val requestChannel: RequestChannel,
    * @return boolean if the member id in the RPC is valid or not.
    */
   def isMemberIdValid(memberId: String): Boolean = {
-    memberId.nonEmpty && memberId.length <= 36
+    memberId != null && memberId.nonEmpty && memberId.length <= 36
   }
 
   private def updateRecordConversionStats(request: RequestChannel.Request,
