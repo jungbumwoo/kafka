@@ -64,8 +64,10 @@
     { "name": "ClusterId", "type": "string", "versions": "12+", "nullableVersions": "12+", "default": "null",
       "taggedVersions": "12+", "tag": 0, "ignorable": true,
       "about": "The clusterId if known. This is used to validate metadata fetches prior to broker registration." },
+    // replicaSate 로 대체됨
     { "name": "ReplicaId", "type": "int32", "versions": "0-14", "default": "-1", "entityType": "brokerId",
       "about": "The broker ID of the follower, of -1 if this request is from a consumer." },
+    // replicaId; replicaEpoch; KIP-903
     { "name": "ReplicaState", "type": "ReplicaState", "versions": "15+", "taggedVersions": "15+", "tag": 1,
       "about": "The state of the replica in the follower.", "fields": [
       { "name": "ReplicaId", "type": "int32", "versions": "15+", "default": "-1", "entityType": "brokerId",
@@ -73,14 +75,18 @@
       { "name": "ReplicaEpoch", "type": "int64", "versions": "15+", "default": "-1",
         "about": "The epoch of this follower, or -1 if not available." }
     ]},
+    // minBytes 만큼 쌓이는걸 얼마나 기다릴지
     { "name": "MaxWaitMs", "type": "int32", "versions": "0+",
       "about": "The maximum time in milliseconds to wait for the response." },
+    // minByte 충족해야 응답
     { "name": "MinBytes", "type": "int32", "versions": "0+",
       "about": "The minimum bytes to accumulate in the response." },
     { "name": "MaxBytes", "type": "int32", "versions": "3+", "default": "0x7fffffff", "ignorable": true,
       "about": "The maximum bytes to fetch.  See KIP-74 for cases where this limit may not be honored." },
+    // 트랜잭션 레코드 가시성 제어. 0=READ_UNCOMMITTED (모든 레코드 반환), 1=READ_COMMITTED (커밋된 트랜잭션 레코드 + 비트랜잭션 레코드만 반환, LSO 기준). 팔로워는 모든 데이터를 복제해야 하므로 보통 0 사용
     { "name": "IsolationLevel", "type": "int8", "versions": "4+", "default": "0", "ignorable": true,
       "about": "This setting controls the visibility of transactional records. Using READ_UNCOMMITTED (isolation_level = 0) makes all records visible. With READ_COMMITTED (isolation_level = 1), non-transactional and COMMITTED transactional records are visible. To be more concrete, READ_COMMITTED returns all data from offsets smaller than the current LSO (last stable offset), and enables the inclusion of the list of aborted transactions in the result, which allows consumers to discard ABORTED transactional records." },
+    // KIP-227. 변경된 파티션 데이터만 주고 받을 수 있도록 session으로 캐싱. 변경 발생하는 부분만 주고 받도록 함
     { "name": "SessionId", "type": "int32", "versions": "7+", "default": "0", "ignorable": true,
       "about": "The fetch session ID." },
     { "name": "SessionEpoch", "type": "int32", "versions": "7+", "default": "-1", "ignorable": true,
