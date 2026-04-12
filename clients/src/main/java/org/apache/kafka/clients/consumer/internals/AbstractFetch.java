@@ -340,6 +340,8 @@ public abstract class AbstractFetch implements Closeable {
      * has yet to process the data for the partition that has already been fetched, we should not go send for more data
      * until the previously-fetched data has been processed.
      *
+     * 이미 버퍼에 적재되어있는 파티션은 요청하지 않음
+     *
      * @param buffered The set of partitions we have in our buffer
      * @return {@link List} of {@link TopicPartition topic partitions} for which we should fetch data
      */

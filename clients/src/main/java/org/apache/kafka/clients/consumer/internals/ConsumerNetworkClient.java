@@ -269,7 +269,7 @@ public class ConsumerNetworkClient implements Closeable {
             handlePendingDisconnects();
 
             // send all the requests we can send now
-            long pollDelayMs = trySend(timer.currentTimeMs());
+            long pollDelayMs = trySend(timer.currentTimeMs()); // unsent queue를 비우고, 버퍼로 옮김
 
             // check whether the poll is still needed by the caller. Note that if the expected completion
             // condition becomes satisfied after the call to shouldBlock() (because of a fired completion
@@ -279,6 +279,8 @@ public class ConsumerNetworkClient implements Closeable {
                 long pollTimeout = Math.min(timer.remainingMs(), pollDelayMs);
                 if (client.inFlightRequestCount() == 0)
                     pollTimeout = Math.min(pollTimeout, retryBackoffMs);
+
+                // 실제 Socket I/O 발생
                 client.poll(pollTimeout, timer.currentTimeMs());
             } else {
                 client.poll(0, timer.currentTimeMs());
@@ -513,7 +515,9 @@ public class ConsumerNetworkClient implements Closeable {
             while (iterator.hasNext()) {
                 ClientRequest request = iterator.next();
                 if (client.ready(node, now)) {
+                    // ConsumerNetworkClient -> NetworkClient로 넘김
                     client.send(request, now);
+                    // ConsumerNetworkClient 전송 큐 unset에서 제거
                     iterator.remove();
                 } else {
                     // try next node when current node is not ready

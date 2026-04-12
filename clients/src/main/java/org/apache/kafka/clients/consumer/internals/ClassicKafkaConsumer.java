@@ -644,6 +644,7 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
 
                 final Fetch<K, V> fetch = pollForFetches(timer);
                 if (!fetch.isEmpty()) {
+                    // return 전에 fetch 요청하여 다음 poll 전에 buffer가 채워질 수 있도록 함
                     // before returning the fetched records, we can send off the next round of fetches
                     // and avoid block waiting for their responses to enable pipelining while the user
                     // is handling the fetched records.
@@ -697,6 +698,7 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
         }
 
         // send any new fetches (won't resend pending fetches)
+        // if data is not avaliable, 내부 buffer에 반환할게 없다면, 브로커에 요청을 보내서 받아옴
         sendFetches();
 
         // We do not want to be stuck blocking in poll if we are missing some positions
@@ -711,6 +713,7 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
         log.trace("Polling for fetches with timeout {}", pollTimeout);
 
         Timer pollTimer = time.timer(pollTimeout);
+        // network io trigger 해줌
         client.poll(pollTimer, () -> {
             // since a fetch might be completed by the background thread, we need this poll condition
             // to ensure that we do not block unnecessarily in poll()

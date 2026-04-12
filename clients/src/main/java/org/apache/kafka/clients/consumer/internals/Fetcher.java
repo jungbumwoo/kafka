@@ -179,6 +179,8 @@ public class Fetcher<K, V> extends AbstractFetch {
      * @param successHandler {@link ResponseHandler Handler for successful responses}
      * @param errorHandler   {@link ResponseHandler Handler for failure responses}
      * @return List of {@link RequestFuture callbacks}
+ㄹ     *
+     * // request enqueue 한거 어디서?
      */
     private List<RequestFuture<ClientResponse>> sendFetchesInternal(Map<Node, FetchSessionHandler.FetchRequestData> fetchRequests,
                                                                     ResponseHandler<ClientResponse> successHandler,

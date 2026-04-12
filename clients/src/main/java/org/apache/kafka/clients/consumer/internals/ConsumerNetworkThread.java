@@ -58,6 +58,8 @@ import static org.apache.kafka.clients.consumer.internals.ConsumerUtils.DEFAULT_
 import static org.apache.kafka.common.utils.Utils.closeQuietly;
 
 /**
+ *
+ * ConsumerNetworkThread 가 background 로 돌면서 더 가져올 공간이 있는지, 현재 진행중인 요청이 없는지 확인 후 user-level에서 poll을 하지 않아도 fetch를 날림
  * Background thread runnable that consumes {@link ApplicationEvent} and produces {@link BackgroundEvent}. It
  * uses an event loop to consume and produce events, and poll the network client to handle network IO.
  */
