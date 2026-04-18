@@ -60,6 +60,9 @@ import static org.apache.kafka.common.utils.Utils.closeQuietly;
 /**
  *
  * ConsumerNetworkThread 가 background 로 돌면서 더 가져올 공간이 있는지, 현재 진행중인 요청이 없는지 확인 후 user-level에서 poll을 하지 않아도 fetch를 날림
+ * ㄴ 아닌듯? network 이나 진행중인 요청나가야할 것들이 기존에 poll 기반으로 트리거되고 있다보니 ConsumerNetworkThread에서도 트리거 시켜주는거지
+ * msg 를 채우는 용도는 아닌 것으로 보임
+ *
  * Background thread runnable that consumes {@link ApplicationEvent} and produces {@link BackgroundEvent}. It
  * uses an event loop to consume and produce events, and poll the network client to handle network IO.
  */
