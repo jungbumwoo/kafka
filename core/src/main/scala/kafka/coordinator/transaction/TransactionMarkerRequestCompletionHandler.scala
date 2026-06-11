@@ -135,13 +135,16 @@ class TransactionMarkerRequestCompletionHandler(brokerId: Int,
                 for ((topicPartition, error) <- errors.asScala) {
                   error match {
                     case Errors.NONE =>
+                      // 성공: 해당 파티션의 TxnMarker 기록 완료 → 추적 목록에서 제거.
+                      // 모든 파티션이 제거되면 maybeWriteTxnCompletion()이 COMPLETE 상태를 기록한다.
                       txnMetadata.removePartition(topicPartition)
 
                     case Errors.CORRUPT_MESSAGE |
                          Errors.MESSAGE_TOO_LARGE |
                          Errors.RECORD_LIST_TOO_LARGE |
-                         Errors.INVALID_REQUIRED_ACKS => // these are all unexpected and fatal errors
-
+                         Errors.INVALID_REQUIRED_ACKS =>
+                      // 브로커가 정상이라면 절대 발생하지 않아야 하는 치명적 에러.
+                      // 프로그래밍 버그이므로 IllegalStateException으로 크래시.
                       throw new IllegalStateException(s"Received fatal error ${error.exceptionName} while sending txn marker for $transactionalId")
 
                     case Errors.UNKNOWN_TOPIC_OR_PARTITION |
@@ -149,16 +152,18 @@ class TransactionMarkerRequestCompletionHandler(brokerId: Int,
                          Errors.NOT_ENOUGH_REPLICAS |
                          Errors.NOT_ENOUGH_REPLICAS_AFTER_APPEND |
                          Errors.REQUEST_TIMED_OUT |
-                         Errors.KAFKA_STORAGE_ERROR => // these are retriable errors
-
+                         Errors.KAFKA_STORAGE_ERROR =>
+                      // 일시적 에러(리더 변경, 네트워크 타임아웃 등): 재시도 대상에 추가.
+                      // 이후 addTxnMarkersToBrokerQueue()로 새 리더에게 재전송한다.
                       info(s"Sending $transactionalId's transaction marker for partition $topicPartition has failed with error ${error.exceptionName}, retrying " +
                         s"with current coordinator epoch ${epochAndMetadata.coordinatorEpoch}")
 
                       retryPartitions += topicPartition
 
                     case Errors.INVALID_PRODUCER_EPOCH |
-                         Errors.TRANSACTION_COORDINATOR_FENCED => // producer or coordinator epoch has changed, this txn can now be ignored
-
+                         Errors.TRANSACTION_COORDINATOR_FENCED =>
+                      // Epoch가 변경되어 이 트랜잭션은 이미 stale 상태.
+                      // 새 coordinator(또는 새 producer epoch)가 처리를 이어받으므로 마커 전송을 중단한다.
                       info(s"Sending $transactionalId's transaction marker for partition $topicPartition has permanently failed with error ${error.exceptionName} " +
                         s"with the current coordinator epoch ${epochAndMetadata.coordinatorEpoch}; cancel sending any more transaction markers $txnMarker to the brokers")
 
@@ -186,7 +191,7 @@ class TransactionMarkerRequestCompletionHandler(brokerId: Int,
                 debug(s"Re-enqueuing ${txnMarker.transactionResult} transaction markers for transactional id $transactionalId " +
                   s"under coordinator epoch ${txnMarker.coordinatorEpoch}")
 
-                // re-enqueue with possible new leaders of the partitions
+                // 재시도 파티션: 리더가 변경되었을 수 있으므로 새 리더를 조회해 큐에 재삽입한다.
                 txnMarkerChannelManager.addTxnMarkersToBrokerQueue(
                   txnMarker.producerId,
                   txnMarker.producerEpoch,
@@ -194,6 +199,7 @@ class TransactionMarkerRequestCompletionHandler(brokerId: Int,
                   pendingCompleteTxn,
                   retryPartitions.toSet)
               } else {
+                // 모든 파티션 성공: topicPartitions가 비었는지 확인 후 COMPLETE 상태를 __transaction_state에 기록한다.
                 txnMarkerChannelManager.maybeWriteTxnCompletion(transactionalId)
               }
             }

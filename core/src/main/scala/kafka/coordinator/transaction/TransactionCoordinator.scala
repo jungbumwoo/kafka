@@ -473,12 +473,14 @@ class TransactionCoordinator(txnConfig: TransactionConfig,
    */
   def onElection(txnTopicPartitionId: Int, coordinatorEpoch: Int): Unit = {
     info(s"Elected as the txn coordinator for partition $txnTopicPartitionId at epoch $coordinatorEpoch")
-    // The operations performed during immigration must be resilient to any previous errors we saw or partial state we
-    // left off during the unloading phase. Ensure we remove all associated state for this partition before we continue
-    // loading it.
+    // 이전 리더가 남긴 stale 마커 전송 작업을 모두 제거한다.
+    // 새 coordinator가 __transaction_state를 로드한 뒤 PREPARE 상태 트랜잭션을 재처리하므로
+    // 이전 작업이 중복 실행되지 않도록 먼저 정리해야 한다.
     txnMarkerChannelManager.removeMarkersForTxnTopicPartition(txnTopicPartitionId)
 
-    // Now load the partition.
+    // __transaction_state 파티션을 로드하고, PREPARE_COMMIT/PREPARE_ABORT 상태의 트랜잭션을
+    // 발견하면 addTxnMarkersToSend를 콜백으로 전달해 마커 전송을 재개한다.
+    // 이 메커니즘이 coordinator crash 후 복구(at-least-once marker delivery)를 보장한다.
     txnManager.loadTransactionsForTxnTopicPartition(txnTopicPartitionId, coordinatorEpoch,
       txnMarkerChannelManager.addTxnMarkersToSend)
   }
@@ -492,12 +494,15 @@ class TransactionCoordinator(txnConfig: TransactionConfig,
    */
   def onResignation(txnTopicPartitionId: Int, coordinatorEpoch: Option[Int]): Unit = {
     info(s"Resigned as the txn coordinator for partition $txnTopicPartitionId at epoch $coordinatorEpoch")
+    // 리더십을 잃었으므로 해당 파티션의 트랜잭션 메타데이터 캐시를 비운다.
+    // 이후 이 파티션에 대한 요청은 NOT_COORDINATOR 에러를 반환해 클라이언트가 재탐색하게 한다.
     coordinatorEpoch match {
       case Some(epoch) =>
         txnManager.removeTransactionsForTxnTopicPartition(txnTopicPartitionId, epoch)
       case None =>
         txnManager.removeTransactionsForTxnTopicPartition(txnTopicPartitionId)
     }
+    // 진행 중인 마커 전송 작업도 취소한다. 새 coordinator가 로드 시 재처리한다.
     txnMarkerChannelManager.removeMarkersForTxnTopicPartition(txnTopicPartitionId)
   }
 
@@ -672,6 +677,32 @@ class TransactionCoordinator(txnConfig: TransactionConfig,
                 case Right((txnMetadata, newPreSendMetadata)) =>
                   // we can respond to the client immediately and continue to write the txn markers if
                   // the log append was successful
+
+                  /*
+                  * Client                   TransactionCoordinator              TransactionMarkerChannelManager
+                    │                              │                                        │
+                    ├─── EndTxn(COMMIT) ──────────>│                                        │
+                    │                              │                                        │
+                    │           ① PREPARE_COMMIT를 __transaction_state에 async 기록         │
+                    │                              │ (appendTransactionToLog, acks=-1)      │
+                    │                              │                                        │
+                    │           ② log write 완료 콜백 수신 (sendTxnMarkersCallback)          │
+                    │<── EndTxnResponse(OK) ───────┤  TransactionCoordinator.scala:675      │
+                    │                              │                                        │
+                    │           ③ marker 전송 요청  ├────── addTxnMarkersToSend() ──────────>│
+                    │                              │       TransactionCoordinator.scala:677 │
+                    │                              │                                        │
+                    │                              │   [InterBrokerSendThread 백그라운드]    │
+                    │                              │            WriteTxnMarkers → 각 broker │
+                    │                              │                                        │
+                    │                              │   각 partition ACK 수신                 │
+                    │                              │   removePartition() per acked partition│
+                    │                              │   모두 ack → maybeWriteTxnCompletion() │
+                    │                              │   COMPLETE_COMMIT 기록 후 상태 확정     │
+                  * */
+                  // jb: client에 응답, marker 전송. 여기서 client에서 이 응답을 못받으면 어떻게 될까?
+                  // marker 가 되기 전에 모종의 에러핸들링으로 다시 msg를 재처리하게 되면 이 부분 중복 방지 처리가 되어있지 않을까싶다.
+                  // 이미 marker가 진행 된 뒤 재처리한다면 그건 이미 marker 처리가 되어있기 때문에 별도 방어 로직이 필요없을듯하다.
                   responseCallback(Errors.NONE, RecordBatch.NO_PRODUCER_ID, RecordBatch.NO_PRODUCER_EPOCH)
 
                   txnMarkerChannelManager.addTxnMarkersToSend(coordinatorEpoch, txnMarkerResult, txnMetadata, newPreSendMetadata)
@@ -1043,15 +1074,21 @@ class TransactionCoordinator(txnConfig: TransactionConfig,
                 s"${txnMetadata.producerId}")
               None
             } else if (txnMetadata.pendingTransitionInProgress) {
+              // 이미 상태 전이가 진행 중(예: EndTxn 처리 중)이면 이번 주기를 건너뛴다.
+              // 다음 스케줄 주기에 다시 확인한다.
               debug(s"Skipping abort of timed out transaction $txnIdAndPidEpoch since there is a " +
                 "pending state transition")
               None
             } else {
+              // producer epoch를 증가시켜 기존 프로듀서를 fencing하고 강제 abort를 준비한다.
+              // epoch 증가로 해당 producer의 후속 요청은 INVALID_PRODUCER_EPOCH 에러를 받는다.
               Some(txnMetadata.prepareFenceProducerEpoch())
             }
           })
 
           transitMetadataOpt.foreach { txnTransitMetadata =>
+            // 서버 주도 abort: isFromClient=false로 endTransaction을 호출해
+            // 만료된 트랜잭션을 PREPARE_ABORT → COMPLETE_ABORT로 정리한다.
             endTransaction(txnMetadata.transactionalId,
               txnTransitMetadata.producerId,
               txnTransitMetadata.producerEpoch,

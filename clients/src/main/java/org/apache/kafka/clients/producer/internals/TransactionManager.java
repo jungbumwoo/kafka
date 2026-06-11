@@ -148,6 +148,40 @@ public class TransactionManager {
     private final boolean enable2PC;
     private volatile ProducerIdAndEpoch preparedTxnState = ProducerIdAndEpoch.NONE;
 
+    /**
+     * 트랜잭션 프로듀서의 상태 머신.
+     *
+     * <p>에러 상태는 두 가지로 구분된다:
+     * <ul>
+     *   <li><b>ABORTABLE_ERROR</b>: 복구 가능한 에러. 애플리케이션이 {@code abortTransaction()}을 호출해
+     *       현재 트랜잭션을 중단하면 ABORTING_TRANSACTION을 거쳐 READY로 복귀하고, 이후 새 트랜잭션을 시작할 수 있다.
+     *       예: 재시도 소진, 특정 토픽 권한 없음, 시퀀스 번호 불일치 등</li>
+     *   <li><b>FATAL_ERROR</b>: 복구 불가능한 에러. 프로듀서를 반드시 닫아야 한다. 어떤 상태에서도
+     *       FATAL_ERROR로 전이할 수 있으며, FATAL_ERROR에서 다른 상태로는 절대 전이할 수 없다.
+     *       예: ProducerFencedException(동일 transactionalId로 신규 프로듀서가 기동), 클러스터 권한 없음 등</li>
+     * </ul>
+     *
+     * <p>정상 흐름:
+     * <pre>
+     *   UNINITIALIZED
+     *     → INITIALIZING  (initTransactions(): InitProducerId 요청 전송)
+     *     → READY         (InitProducerId 응답 수신 완료)
+     *     → IN_TRANSACTION  (beginTransaction())
+     *     → COMMITTING_TRANSACTION  (commitTransaction() → beginCommit())
+     *     → READY         (EndTxnResponse 수신 완료)
+     * </pre>
+     *
+     * <p>에러 복구 흐름:
+     * <pre>
+     *   IN_TRANSACTION / COMMITTING_TRANSACTION
+     *     → ABORTABLE_ERROR  (복구 가능한 에러 발생)
+     *     → ABORTING_TRANSACTION  (abortTransaction() → beginAbort())
+     *     → READY  (EndTxn(ABORT) 응답 수신 완료, 새 트랜잭션 재시작 가능)
+     *
+     *   any state
+     *     → FATAL_ERROR  (복구 불가 에러 발생 → 프로듀서 종료 필요)
+     * </pre>
+     */
     private enum State {
         UNINITIALIZED,
         INITIALIZING,
@@ -156,7 +190,9 @@ public class TransactionManager {
         PREPARED_TRANSACTION,
         COMMITTING_TRANSACTION,
         ABORTING_TRANSACTION,
+        /** 복구 가능한 에러 상태. abortTransaction()으로 ABORTING_TRANSACTION → READY 복귀 가능. */
         ABORTABLE_ERROR,
+        /** 복구 불가 에러 상태. 프로듀서를 닫아야 한다. 모든 상태에서 전이 가능하며 탈출 불가. */
         FATAL_ERROR;
 
         private boolean isTransitionValid(State source, State target) {
@@ -174,6 +210,7 @@ public class TransactionManager {
                 case COMMITTING_TRANSACTION:
                     return source == IN_TRANSACTION || source == PREPARED_TRANSACTION;
                 case ABORTING_TRANSACTION:
+                    // ABORTABLE_ERROR → ABORTING_TRANSACTION: 에러 복구 경로
                     return source == IN_TRANSACTION || source == PREPARED_TRANSACTION || source == ABORTABLE_ERROR;
                 case ABORTABLE_ERROR:
                     return source == IN_TRANSACTION || source == COMMITTING_TRANSACTION || source == ABORTABLE_ERROR
@@ -378,6 +415,22 @@ public class TransactionManager {
         }, State.COMMITTING_TRANSACTION, "commitTransaction");
     }
 
+    /**
+     * ABORTABLE_ERROR 상태에서 트랜잭션 중단(abort)을 시작한다. 에러 복구의 핵심 진입점.
+     *
+     * <p>동작:
+     * <ol>
+     *   <li>현재 상태가 ABORTABLE_ERROR가 아니면 {@link #maybeFailWithError()}로 예외를 던진다
+     *       (FATAL_ERROR인 경우 복구 불가 예외 전파)</li>
+     *   <li>ABORTING_TRANSACTION으로 상태 전이</li>
+     *   <li>{@code newPartitionsInTransaction}을 비워 미등록 파티션 삭제
+     *       (아직 AddPartitionsToTxn을 보내지 않은 파티션은 그냥 버린다)</li>
+     *   <li>{@link #beginCompletingTransaction}(ABORT)을 호출해 EndTxn(ABORT) 핸들러를 pendingRequests에 등록</li>
+     * </ol>
+     *
+     * <p>EndTxn(ABORT) 응답을 받으면 {@code resetTransactionState()}가 호출되어 READY로 복귀한다.
+     * 이후 {@code beginTransaction()}으로 새 트랜잭션을 시작할 수 있다.
+     */
     public synchronized TransactionalRequestResult beginAbort() {
         return handleCachedTransactionRequestResult(() -> {
             if (currentState != State.ABORTABLE_ERROR)
@@ -547,6 +600,13 @@ public class TransactionManager {
         return currentState == State.ABORTING_TRANSACTION;
     }
 
+    /**
+     * 복구 가능한 에러 상태로 전이한다.
+     *
+     * <p>이미 ABORTING_TRANSACTION 중이라면 abort가 진행 중이므로 전이를 건너뛴다.
+     * 이후 애플리케이션이 {@code abortTransaction()}을 호출하면
+     * ABORTING_TRANSACTION → READY 경로로 복구된다.
+     */
     synchronized void transitionToAbortableError(RuntimeException exception) {
         if (currentState == State.ABORTING_TRANSACTION) {
             log.debug("Skipping transition to abortable error state since the transaction is already being " +
@@ -558,6 +618,13 @@ public class TransactionManager {
         transitionTo(State.ABORTABLE_ERROR, exception);
     }
 
+    /**
+     * 복구 불가 에러 상태로 전이한다.
+     *
+     * <p>FATAL_ERROR는 탈출 불가능하다. 프로듀서를 반드시 닫아야 한다.
+     * pendingTransition이 있으면(앱 스레드가 commit/abort를 await 중)
+     * 즉시 {@code result.fail()}로 깨워 예외를 전파한다.
+     */
     synchronized void transitionToFatalError(RuntimeException exception) {
         log.info("Transiting to fatal error state due to {}", exception.toString());
         transitionTo(State.FATAL_ERROR, exception);
@@ -568,11 +635,15 @@ public class TransactionManager {
     }
 
     /**
-     * Transitions to an abortable error state if the coordinator can handle an abortable error or
-     * to a fatal error if not.
+     * 코디네이터의 epoch bump 지원 여부에 따라 에러 상태를 결정한다.
      *
-     * @param abortableException    The exception in case of an abortable error.
-     * @param fatalException        The exception in case of a fatal error.
+     * <ul>
+     *   <li>epoch bump 가능(TV1 수동 bump 또는 TV2 서버 자동 bump): ABORTABLE_ERROR → abortTransaction()으로 복구 가능</li>
+     *   <li>epoch bump 불가(구버전 브로커): 동일 epoch로 재시도 시 중복 쓰기 위험 → FATAL_ERROR로 강등</li>
+     * </ul>
+     *
+     * @param abortableException    복구 가능한 경우에 사용할 예외
+     * @param fatalException        복구 불가한 경우에 사용할 예외
      */
     private void transitionToAbortableErrorOrFatalError(
         RuntimeException abortableException,
@@ -781,6 +852,27 @@ public class TransactionManager {
         lastError = null;
     }
 
+    /**
+     * ProduceResponse 에러를 ABORTABLE_ERROR / FATAL_ERROR 중 하나로 분류해 상태를 전이한다.
+     *
+     * <p><b>FATAL_ERROR로 분류되는 에러:</b>
+     * <ul>
+     *   <li>{@code ClusterAuthorizationException}: 클러스터 수준 권한 없음 → 프로듀서 자체 사용 불가</li>
+     *   <li>{@code TransactionalIdAuthorizationException}: transactionalId 권한 없음</li>
+     *   <li>{@code ProducerFencedException}: 동일 transactionalId로 새 프로듀서가 기동되어 현재 프로듀서가 fencing됨</li>
+     *   <li>{@code UnsupportedVersionException}: 브로커가 필요 API 버전을 지원하지 않음</li>
+     *   <li>{@code InvalidPidMappingException}: 브로커에 producer ID 매핑 없음</li>
+     * </ul>
+     *
+     * <p><b>ABORTABLE_ERROR로 분류되는 에러 (트랜잭션 프로듀서 한정):</b>
+     * <ul>
+     *   <li>{@code RetriableException}: 재시도를 모두 소진한 일시적 에러 → {@code TransactionAbortableException}으로 래핑</li>
+     *   <li>{@code InvalidTxnStateException}: 서버 측 트랜잭션 상태 불일치 → 동일하게 래핑</li>
+     *   <li>그 외 모든 예외: ABORTABLE_ERROR로 전이</li>
+     * </ul>
+     *
+     * <p>non-transactional(idempotent 전용) 프로듀서는 에러 상태 전이 없이 에러를 그대로 반환한다.
+     */
     public synchronized void maybeTransitionToErrorState(RuntimeException exception) {
         if (exception instanceof ClusterAuthorizationException
                 || exception instanceof TransactionalIdAuthorizationException
@@ -805,6 +897,28 @@ public class TransactionManager {
         }
     }
 
+    /**
+     * ProduceResponse 실패 배치를 처리한다.
+     *
+     * <p>처리 순서:
+     * <ol>
+     *   <li>{@link #maybeTransitionToErrorState}: 에러 종류에 따라 ABORTABLE_ERROR / FATAL_ERROR 전이</li>
+     *   <li>in-flight 배치 추적 목록에서 제거</li>
+     *   <li>FATAL_ERROR면 이후 처리 불필요 → 즉시 반환</li>
+     *   <li>시퀀스 번호 정합성 복구:
+     *     <ul>
+     *       <li>{@code OutOfOrderSequenceException} (non-transactional): 로그에 갭 발생 → epoch bump로 시퀀스 리셋</li>
+     *       <li>{@code UnknownProducerIdException}: 브로커가 프로듀서 상태를 잃음 → 시퀀스를 0으로 리셋,
+     *           이후 abort 후 재시작 시 서버가 sequence 0부터 수용</li>
+     *       <li>그 외 + adjustSequenceNumbers=true:
+     *           non-transactional이면 epoch bump, transactional이면 남은 in-flight 배치의 시퀀스 번호 재조정</li>
+     *     </ul>
+     *   </li>
+     * </ol>
+     *
+     * @param adjustSequenceNumbers 재시도를 모두 소진하지 않은 경우 false(시퀀스 갭 불확실),
+     *                              소진한 경우 true(갭 확정이므로 재조정 필요)
+     */
     synchronized void handleFailedBatch(ProducerBatch batch, RuntimeException exception, boolean adjustSequenceNumbers) {
         maybeTransitionToErrorState(exception);
         removeInFlightBatch(batch);
@@ -920,8 +1034,9 @@ public class TransactionManager {
             return null;
 
         // Do not send the EndTxn until all batches have been flushed
+        // jb: 이 부분 중요. commitTransaction()을 호출하기 이전에 partition write가 완료되어 있어야 하는 것이 아니라, Sender 스레드가 알아서 drain을 완료한 뒤 EndTxn을 전송하는 구조?
         if (nextRequestHandler.isEndTxn() && hasIncompleteBatches)
-            return null;
+            return null; // in-flight batch가 있으면 EndTxn을 큐에서 꺼내지 않음
 
         pendingRequests.poll();
         if (maybeTerminateRequestWithError(nextRequestHandler)) {
@@ -1169,6 +1284,18 @@ public class TransactionManager {
             throw new IllegalStateException("Transactional method invoked on a non-transactional producer.");
     }
 
+    /**
+     * 현재 에러 상태를 확인하고, 에러가 있으면 예외를 던진다.
+     *
+     * <p>모든 트랜잭션 API({@code beginTransaction}, {@code maybeAddPartition},
+     * {@code beginCommit} 등)는 이 메서드를 가장 먼저 호출한다.
+     * Sender I/O 스레드에서 비동기로 발생한 에러가 여기서 앱 스레드에 전파된다.
+     *
+     * <ul>
+     *   <li>{@code ABORTABLE_ERROR}: {@code KafkaException(lastError)} 던짐 → 앱은 {@code abortTransaction()} 호출 가능</li>
+     *   <li>{@code FATAL_ERROR}: {@code ProducerFencedException} 또는 {@code KafkaException} 던짐 → 프로듀서 종료 필요</li>
+     * </ul>
+     */
     private void maybeFailWithError() {
         if (!hasError()) {
             return;

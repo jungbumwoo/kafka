@@ -689,6 +689,39 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         transactionManager.maybeUpdateTransactionV2Enabled(true);
     }
 
+    /*
+    * jb: beginTransaction() → send() → commitTransaction() 전체 흐름
+
+  Producer App Thread                    Sender I/O Thread (백그라운드)
+  ───────────────────                    ──────────────────────────────
+  beginTransaction()
+    IN_TRANSACTION 상태로 전환 (메모리만)
+
+  send(record to partition-A)
+    accumulator에 배치 append
+    newPartitionsInTransaction.add(A)    ──► nextRequest() 호출 시:
+    [배치는 accumulator에 있지만           newPartitions 있으면
+     drain 차단 상태]                       AddPartitionsToTxnRequest 전송
+                                            → 응답 받으면 partitionsInTransaction.add(A)
+                                            → 이때부터 drain 허용
+                                            → ProduceRequest 전송 & ack 수신
+
+  send(record to partition-B)
+    (동일 흐름 반복)
+
+  commitTransaction()
+    COMMITTING_TRANSACTION 상태로 전환
+    pendingRequests에 EndTxnHandler 등록
+    result.await() [BLOCK]               ──► incomplete 배치 모두 ack 될 때까지 EndTxn 보류
+                                             모두 ack → EndTxnRequest 전송
+                                             * TransactionManager
+                                             * if (nextRequestHandler.isEndTxn() && hasIncompleteBatches) {}
+                                             *
+                                             EndTxnResponse → result.done()
+    [UNBLOCK]
+  ---
+    * */
+
     /**
      * Should be called before the start of each new transaction. Note that prior to the first invocation
      * of this method, you must invoke {@link #initTransactions()} exactly one time.

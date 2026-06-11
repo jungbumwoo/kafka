@@ -443,8 +443,22 @@ class TransactionStateManager(brokerId: Int,
     props
   }
 
+  // transactionalId를 해시해 __transaction_state의 어떤 파티션에 저장할지 결정한다.
+  // 같은 transactionalId는 항상 같은 파티션 → 같은 Coordinator 브로커가 담당한다.
   def partitionFor(transactionalId: String): Int = Utils.abs(transactionalId.hashCode) % transactionTopicPartitionCount
 
+  /**
+   * 이 브로커가 __transaction_state 파티션의 리더가 될 때 호출된다.
+   * 해당 파티션의 logStartOffset부터 logEndOffset까지 모든 레코드를 순서대로 읽어
+   * transactionalId → TransactionMetadata 인메모리 캐시를 재구성한다.
+   *
+   * 처리 규칙:
+   *   - TxnTombstone (value=null): 해당 transactionalId를 캐시에서 제거
+   *   - TxnRecord    (정상 레코드): 캐시에 put (같은 키가 있으면 최신 값으로 덮어씀)
+   *   - UnknownKeyVersion / UnknownValueVersion: 경고 로그 후 무시 (미래 버전 호환성)
+   *
+   * 로딩 중 리더십이 변경되면(logEndOffset = -1) 루프가 중단된다.
+   */
   private def loadTransactionMetadata(topicPartition: TopicPartition, coordinatorEpoch: Int): ConcurrentMap[String, TransactionMetadata] =  {
     def logEndOffset = replicaManager.getLogEndOffset(topicPartition).getOrElse(-1L)
 
@@ -506,8 +520,10 @@ class TransactionStateManager(brokerId: Int,
                   case v: TransactionLog.UnknownValueVersion =>
                     warn(unknownVersionWarning("value", v.version()))
                   case r: TransactionLog.TxnTombstone =>
+                    // 툼스톤 레코드: 해당 transactionalId가 만료되었음 → 캐시에서 제거
                     loadedTransactions.remove(r.transactionId())
                   case r: TransactionLog.TxnRecord =>
+                    // 정상 레코드: 최신 상태로 캐시 갱신 (compacted log의 최신 레코드가 최종 상태)
                     loadedTransactions.put(r.transactionId(), r.metadata())
                 }
               }
@@ -569,7 +585,10 @@ class TransactionStateManager(brokerId: Int,
           val transactionsPendingForCompletion = new mutable.ListBuffer[TransactionalIdCoordinatorEpochAndTransitMetadata]
           loadedTransactions.forEach((transactionalId, txnMetadata) => {
             txnMetadata.inLock(() => {
-              // if state is PrepareCommit or PrepareAbort we need to complete the transaction
+              // coordinator crash 복구: PREPARE_ABORT / PREPARE_COMMIT 상태는 마커가 아직 전송되지 않은
+              // 미완료 트랜잭션이다. 새 coordinator가 마커 전송을 이어받아 at-least-once 완료를 보장한다.
+              // PREPARE 상태는 __transaction_state에 이미 durably 기록되었으므로 중복 마커 전송은
+              // 데이터 파티션의 idempotent 처리(epoch/sequence 검사)에 의해 안전하게 무시된다.
               txnMetadata.state match {
                 case TransactionState.PREPARE_ABORT =>
                   transactionsPendingForCompletion +=
@@ -652,6 +671,33 @@ class TransactionStateManager(brokerId: Int,
       throw new KafkaException(s"Transaction topic number of partitions has changed from $previouslyDeterminedPartitionCount to $curTransactionTopicPartitionCount")
   }
 
+  /**
+   * __transaction_state 토픽에 트랜잭션 상태 변경 레코드를 기록한다.
+   * 모든 상태 변경(EMPTY, ONGOING, PREPARE_COMMIT, PREPARE_ABORT, COMPLETE_COMMIT, COMPLETE_ABORT)은
+   * 반드시 이 메서드를 통해 로그에 먼저 기록되고 성공한 이후에 인메모리 캐시가 갱신된다.
+   *
+   * 전체 흐름:
+   * <pre>
+   *   1. TransactionLog.keyToBytes / valueToBytes 로 레코드를 직렬화
+   *   2. partitionFor(transactionalId) 로 대상 __transaction_state 파티션 결정
+   *   3. replicaManager.appendRecords() 로 비동기 기록 (requiredAcks=-1, 압축 없음)
+   *   4a. 성공 시 updateCacheCallback: metadata.completeTransitionTo(newMetadata) 호출
+   *       → 인메모리 TransactionMetadata의 state 및 모든 필드가 실제로 갱신됨
+   *   4b. 실패 시 updateCacheCallback: metadata.pendingState(Optional.empty()) 로 롤백
+   *       → 다음 시도에서 같은 전이를 다시 시도할 수 있도록 pendingState를 초기화
+   * </pre>
+   *
+   * 에러 처리 (로그 쓰기 실패 → 클라이언트 응답 에러 코드 변환):
+   *   UNKNOWN_TOPIC_OR_PARTITION / NOT_ENOUGH_REPLICAS / REQUEST_TIMED_OUT → COORDINATOR_NOT_AVAILABLE
+   *   NOT_LEADER_OR_FOLLOWER / KAFKA_STORAGE_ERROR                          → NOT_COORDINATOR
+   *   MESSAGE_TOO_LARGE / RECORD_LIST_TOO_LARGE                             → UNKNOWN_SERVER_ERROR
+   *
+   * @param transactionalId   트랜잭션 ID (레코드 키)
+   * @param coordinatorEpoch  현재 Coordinator epoch (리더십 변경 감지에 사용)
+   * @param newMetadata       기록할 목표 상태 스냅샷 (prepareXxx()의 반환값)
+   * @param responseCallback  클라이언트에게 반환할 에러 코드 콜백
+   * @param retryOnError      특정 에러 발생 시 pendingState를 유지하고 재시도할지 여부
+   */
   def appendTransactionToLog(transactionalId: String,
                              coordinatorEpoch: Int,
                              newMetadata: TxnTransitMetadata,
@@ -659,7 +705,7 @@ class TransactionStateManager(brokerId: Int,
                              retryOnError: Errors => Boolean = _ => false,
                              requestLocal: RequestLocal): Unit = {
 
-    // generate the message for this transaction metadata
+    // __transaction_state 레코드의 key/value 바이트 생성
     val keyBytes = TransactionLog.keyToBytes(transactionalId)
     val valueBytes = TransactionLog.valueToBytes(newMetadata, transactionVersionLevel())
     val timestamp = time.milliseconds()
@@ -670,6 +716,7 @@ class TransactionStateManager(brokerId: Int,
     val recordsPerPartition = Map(transactionStateTopicIdPartition -> records)
 
     // set the callback function to update transaction status in cache after log append completed
+    // 로그 쓰기 완료 후 호출되는 콜백: 성공이면 인메모리 상태를 갱신하고, 실패이면 pendingState를 롤백한다.
     def updateCacheCallback(responseStatus: collection.Map[TopicIdPartition, PartitionResponse]): Unit = {
       // the append response should only contain the topics partition
       if (responseStatus.size != 1 || !responseStatus.contains(transactionStateTopicIdPartition))
@@ -707,6 +754,7 @@ class TransactionStateManager(brokerId: Int,
       if (responseError == Errors.NONE) {
         // now try to update the cache: we need to update the status in-place instead of
         // overwriting the whole object to ensure synchronization
+        // 로그 쓰기 성공 → completeTransitionTo()로 인메모리 상태를 실제로 갱신한다.
         getTransactionState(transactionalId) match {
           case Left(err) =>
             info(s"Accessing the cached transaction metadata for $transactionalId returns $err error; " +
@@ -739,6 +787,8 @@ class TransactionStateManager(brokerId: Int,
         }
       } else {
         // Reset the pending state when returning an error, since there is no active transaction for the transactional id at this point.
+        // 로그 쓰기 실패 → pendingState를 empty로 초기화해 다음 요청에서 재전이가 가능하도록 롤백한다.
+        // retryOnError가 true를 반환하는 에러는 pendingState를 유지해 caller가 재시도하도록 한다.
         getTransactionState(transactionalId) match {
           case Right(Some(epochAndTxnMetadata)) =>
             val metadata = epochAndTxnMetadata.transactionMetadata
@@ -781,6 +831,11 @@ class TransactionStateManager(brokerId: Int,
       // returns and before appendRecords() is called, since otherwise entries with a high coordinator epoch could have
       // been appended to the log in between these two events, and therefore appendRecords() would append entries with
       // an old coordinator epoch that can still be successfully replicated on followers and make the log in a bad state.
+      //
+      // stateLock 읽기 락을 유지하는 이유:
+      // appendRecords() 호출 전·후 사이에 파티션 emigration/immigration이 완료되면
+      // 새 Coordinator epoch의 레코드가 먼저 기록될 수 있다. 그 후 이전 epoch의 레코드가
+      // 뒤에 붙으면 로그 상태가 오염된다. 읽기 락을 통해 이 경쟁 조건을 방지한다.
       getTransactionState(transactionalId) match {
         case Left(err) =>
           responseCallback(err)
@@ -804,6 +859,9 @@ class TransactionStateManager(brokerId: Int,
             }
           })
           if (append) {
+            // 모든 ISR에 복제 완료(acks=-1) 후 updateCacheCallback을 호출한다.
+            // timeout은 txnTimeoutMs를 사용하지만, 트랜잭션 타임아웃과 직접 연관은 없으며
+            // 단순히 "합리적인 상한"으로 재사용하는 것이다.
             replicaManager.appendRecords(
               timeout = newMetadata.txnTimeoutMs.toLong,
               requiredAcks = TransactionLog.ENFORCED_REQUIRED_ACKS,

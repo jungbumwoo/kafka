@@ -314,7 +314,8 @@ public class Sender implements Runnable {
 
                 RuntimeException lastError = transactionManager.lastError();
 
-                // do not continue sending if the transaction manager is in a failed state
+                // FATAL_ERROR 상태: Sender 스레드는 즉시 모든 pending 배치를 에러로 완료시키고
+                // 더 이상 produce 요청을 보내지 않는다. 프로듀서는 종료되어야 한다.
                 if (transactionManager.hasFatalError()) {
                     if (lastError != null)
                         maybeAbortBatches(lastError);
@@ -369,6 +370,9 @@ public class Sender implements Runnable {
             String errorMessage = "Expiring " + expiredBatch.recordCount + " record(s) for " + expiredBatch.topicPartition
                 + ":" + (now - expiredBatch.createdMs) + " ms has passed since batch creation. "
                 + "The request has not been sent, or no server response has been received yet.";
+            // delivery.timeout.ms 초과: 배치를 TimeoutException으로 실패 처리.
+            // 이 배치가 재시도 중이었다면 서버가 이미 수신했을 수 있으므로 시퀀스가 미해결 상태로 남는다.
+            // markSequenceUnresolved()로 표시해, 이후 maybeResolveSequences()에서 갭 여부를 확인하게 한다.
             failBatch(expiredBatch, new TimeoutException(errorMessage), false, deallocateBuffer);
             if (transactionManager != null && expiredBatch.inRetry()) {
                 // This ensures that no new batches are drained until the current in flight batches are fully resolved.
@@ -696,6 +700,7 @@ public class Sender implements Runnable {
                     batch.topicPartition,
                     this.retries - batch.attempts() - 1,
                     formatErrMsg(response));
+                // 재시도 가능한 에러(리더 변경 등): 배치를 accumulator에 다시 삽입해 투명하게 재전송
                 reenqueueBatch(batch, now);
             } else if (error == Errors.DUPLICATE_SEQUENCE_NUMBER) {
                 // If we have received a duplicate sequence error, it means that the sequence number has advanced beyond
@@ -703,11 +708,16 @@ public class Sender implements Runnable {
                 // the correct offset and timestamp.
                 //
                 // The only thing we can do is to return success to the user and not return a valid offset and timestamp.
+                // 중복 시퀀스: 브로커가 이미 저장했지만 ack를 못 받은 케이스(idempotent 보장).
+                // 오프셋/타임스탬프 없이 성공으로 처리한다.
                 completeBatch(batch, response);
             } else {
                 // tell the user the result of their request. We only adjust sequence numbers if the batch didn't exhaust
                 // its retries -- if it did, we don't know whether the sequence number was accepted or not, and
                 // thus it is not safe to reassign the sequence.
+                // 재시도 소진 또는 치명적 에러: 유저에게 에러 반환.
+                // adjustSequenceNumbers = (재시도를 아직 한 번도 하지 않은 경우 false)
+                // → 소진한 경우 서버 수신 여부 불명 → 시퀀스 재조정 필요(true)
                 failBatch(batch, response, batch.attempts() < this.retries, true);
             }
             if (error.exception() instanceof InvalidMetadataException) {
