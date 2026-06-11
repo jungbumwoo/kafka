@@ -34,6 +34,36 @@ import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 
+/**
+ * __transaction_state 토픽에 대응하는 트랜잭션의 인메모리 메타데이터.
+ *
+ * <p>TransactionStateManager의 캐시에 transactionalId를 키로 저장되며,
+ * 모든 상태 변경은 2단계로 이루어진다:
+ * <pre>
+ *   1. prepare 단계: prepareXxx() 호출 → pendingState를 설정하고 TxnTransitMetadata 스냅샷 반환
+ *                    아직 this.state는 변경되지 않음.
+ *   2. complete 단계: appendTransactionToLog()가 __transaction_state 쓰기 성공 후
+ *                     completeTransitionTo(TxnTransitMetadata) 호출 → this.state 및 모든 필드 갱신
+ * </pre>
+ *
+ * <p>이 2단계 패턴은 로그 쓰기 실패 시 인메모리 상태와 로그 상태의 불일치를 방지한다.
+ * pendingState가 설정된 동안에는 동일 transactionalId에 대한 다른 상태 전이를 차단한다.
+ *
+ * <p>필드와 __transaction_state 레코드 필드의 대응:
+ * <pre>
+ *   producerId          ↔ ProducerId              (현재 Producer ID)
+ *   prevProducerId      ↔ PreviousProducerId       (마지막 커밋 트랜잭션의 Producer ID)
+ *   nextProducerId      ↔ NextProducerId           (epoch overflow 시 다음에 쓸 Producer ID)
+ *   producerEpoch       ↔ ProducerEpoch            (현재 epoch, fencing 기준)
+ *   lastProducerEpoch   ↔ NextProducerEpoch(TV2)   (직전 epoch, 재시도 감지에 사용)
+ *   txnTimeoutMs        ↔ TransactionTimeoutMs
+ *   state               ↔ TransactionStatus        (TransactionState.id() 바이트값)
+ *   topicPartitions     ↔ TransactionPartitions    (EMPTY 상태이면 빈 배열)
+ *   txnStartTimestamp   ↔ TransactionStartTimestampMs
+ *   txnLastUpdateTimestamp ↔ TransactionLastUpdateTimestampMs
+ *   clientTransactionVersion ↔ ClientTransactionVersion
+ * </pre>
+ */
 public class TransactionMetadata {
     private static final Logger LOGGER = LoggerFactory.getLogger(TransactionMetadata.class);
     private final String transactionalId;
@@ -53,10 +83,16 @@ public class TransactionMetadata {
     // pending state is used to indicate the state that this transaction is going to
     // transit to, and for blocking future attempts to transit it again if it is not legal;
     // initialized as the same as the current state
+    //
+    // 로그 쓰기가 진행 중인 목표 상태. 값이 있으면 해당 transactionalId에 대한
+    // 다른 상태 전이 시도를 차단한다. 로그 쓰기 성공 후 completeTransitionTo()에서
+    // 실제 state로 반영되고 Optional.empty()로 초기화된다.
     private Optional<TransactionState> pendingState;
 
     // Indicates that during a previous attempt to fence a producer, the bumped epoch may not have been
     // successfully written to the log. If this is true, we will not bump the epoch again when fencing
+    // prepareFenceProducerEpoch() 중 로그 쓰기가 실패한 경우 true로 설정.
+    // 이미 epoch를 올렸을 수 있으므로, 재시도 시 epoch를 다시 올리지 않아야 한다.
     private boolean hasFailedEpochFence;
 
     private final ReentrantLock lock;
@@ -315,6 +351,17 @@ public class TransactionMetadata {
             state == TransactionState.PREPARE_COMMIT;
     }
 
+    /**
+     * 상태 전이를 준비하는 공통 내부 메서드.
+     *
+     * <p>동작:
+     * 1. 이미 pendingState가 설정되어 있으면 IllegalStateException을 던진다.
+     *    (동시에 두 개의 상태 전이가 진행될 수 없다)
+     * 2. producerId/producerEpoch 값 유효성을 검사한다.
+     * 3. VALID_PREVIOUS_STATES 맵을 조회해 현재 state → 목표 state 전이가 허용되는지 확인한다.
+     * 4. 허용되면 pendingState를 목표 상태로 설정하고 TxnTransitMetadata 스냅샷을 반환한다.
+     *    이 스냅샷이 TransactionLog.valueToBytes()에 전달되어 __transaction_state에 기록된다.
+     */
     private TxnTransitMetadata prepareTransitionTo(TransitionData data) {
         if (pendingState.isPresent())
             throw new IllegalStateException("Preparing transaction state transition to " + state +
@@ -346,6 +393,27 @@ public class TransactionMetadata {
     }
 
     @SuppressWarnings("CyclomaticComplexity")
+    /**
+     * __transaction_state에 레코드가 성공적으로 기록된 후 인메모리 상태를 실제로 갱신한다.
+     *
+     * <p>이 메서드는 TransactionStateManager.appendTransactionToLog()의 성공 콜백에서만 호출된다.
+     * 다음 조건을 모두 검증한 후에 상태를 갱신한다:
+     * <ol>
+     *   <li>pendingState가 설정되어 있어야 한다 (prepare 단계가 먼저 완료되어야 함).</li>
+     *   <li>transitMetadata의 txnState가 pendingState와 일치해야 한다.</li>
+     *   <li>목표 상태별 추가 검증:
+     *     <ul>
+     *       <li>EMPTY: topicPartitions 비어 있어야 함, txnStartTimestamp=-1 이어야 함</li>
+     *       <li>ONGOING: 기존 partitions ⊆ 새 partitions, timeout 불변</li>
+     *       <li>PREPARE_COMMIT/ABORT: partitions 집합 동일, timeout 불변, timestamp 유효</li>
+     *       <li>COMPLETE_COMMIT/ABORT: epoch 유효, txnStartTimestamp != -1</li>
+     *       <li>PREPARE_EPOCH_FENCE: 이 상태로의 complete는 허용하지 않음 (예외)</li>
+     *       <li>DEAD: 이 상태로의 complete는 허용하지 않음 (예외) → 캐시에서 직접 제거</li>
+     *     </ul>
+     *   </li>
+     * </ol>
+     * 검증 통과 후 모든 필드를 transitMetadata 값으로 덮어쓰고 pendingState를 empty로 초기화한다.
+     */
     public void completeTransitionTo(TxnTransitMetadata transitMetadata) {
         // metadata transition is valid only if all the following conditions are met:
         //
