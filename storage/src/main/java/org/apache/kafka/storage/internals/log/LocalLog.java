@@ -528,6 +528,17 @@ public class LocalLog {
         updateLogEndOffset(lastOffset + 1);
     }
 
+    /**
+     * read_committed FetchResponse에 abortedTransactions 목록을 붙여 반환한다.
+     *
+     * <p>fetch 범위(startOffset ~ upperBoundOffset)와 겹치는 abort 트랜잭션을 .txnindex 파일에서
+     * 수집한 뒤, {@link FetchDataInfo}의 abortedTransactions 필드로 포함시킨다.
+     * 컨슈머는 이 목록을 사용해 {@code CompletedFetch.consumeAbortedTransactionsUpTo()}에서
+     * abort된 배치를 lazily 걸러낸다.
+     *
+     * <p>upperBoundOffset 계산: 현재 세그먼트의 물리적 fetch 상한(fetchUpperBoundOffset)을 먼저 시도하고,
+     * 없으면 다음 세그먼트의 baseOffset, 그것도 없으면 logEndOffset을 사용한다.
+     */
     FetchDataInfo addAbortedTransactions(long startOffset, LogSegment segment, FetchDataInfo fetchInfo) throws IOException {
         int fetchSize = fetchInfo.records.sizeInBytes();
         OffsetPosition startOffsetPosition = new OffsetPosition(
@@ -549,6 +560,13 @@ public class LocalLog {
                 Optional.of(abortedTransactions));
     }
 
+    /**
+     * startingSegment부터 시작해 여러 세그먼트에 걸쳐 abort 트랜잭션을 수집한다.
+     *
+     * <p>각 세그먼트의 {@link LogSegment#collectAbortedTxns}를 호출하고, 결과를 accumulator에 전달한다.
+     * {@link TxnIndexSearchResult#isComplete()}가 true이면 upperBoundOffset을 지난 것이므로 조기 종료한다.
+     * false이면 이 세그먼트만으로는 범위가 커버되지 않으므로 다음 세그먼트로 이어서 탐색한다.
+     */
     private void collectAbortedTransactions(long startOffset, long upperBoundOffset,
                                             LogSegment startingSegment,
                                             Consumer<List<AbortedTxn>> accumulator) {

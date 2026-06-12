@@ -131,7 +131,7 @@ public class DefaultRecordBatch extends AbstractRecordBatch implements MutableRe
     public static final int RECORD_BATCH_OVERHEAD = RECORDS_OFFSET;
 
     private static final byte COMPRESSION_CODEC_MASK = 0x07;
-    private static final byte TRANSACTIONAL_FLAG_MASK = 0x10;
+    private static final byte TRANSACTIONAL_FLAG_MASK = 0x10; // jb: 배치 header attributes byte의 bit 4
     private static final int CONTROL_FLAG_MASK = 0x20;
     private static final byte DELETE_HORIZON_FLAG_MASK = 0x40;
     private static final byte TIMESTAMP_TYPE_MASK = 0x08;

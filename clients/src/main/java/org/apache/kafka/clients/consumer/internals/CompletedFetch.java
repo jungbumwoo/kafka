@@ -65,6 +65,20 @@ public class CompletedFetch {
     private final SubscriptionState subscriptions;
     private final BufferSupplier decompressionBufferSupplier;
     private final Iterator<? extends RecordBatch> batches;
+
+    /**
+     * read_committed 필터링에 사용되는 두 자료구조.
+     *
+     * <p><b>abortedTransactions</b>: 브로커가 FetchResponse에 포함시킨 abort된 트랜잭션 목록.
+     * {producerId, firstOffset} 쌍만 담고 있으며, firstOffset 기준 오름차순 min-heap으로 관리된다.
+     * 배치를 앞에서부터 순서대로 읽으며 "이 배치의 lastOffset까지 시작된" 트랜잭션만
+     * lazy하게 pop해 abortedProducerIds에 추가한다.
+     *
+     * <p><b>abortedProducerIds</b>: 현재 "abort 진행 중"으로 활성화된 producerId 집합.
+     * 새 배치를 읽을 때마다 consumeAbortedTransactionsUpTo()로 갱신된다.
+     * abort 마커(control batch) 를 만나면 해당 producerId를 제거한다.
+     * isBatchAborted()에서 이 집합을 조회해 배치를 skip할지 결정한다.
+     */
     private final Set<Long> abortedProducerIds;
     private final PriorityQueue<FetchResponseData.AbortedTransaction> abortedTransactions;
     private final FetchMetricsAggregator metricAggregator;
@@ -201,9 +215,19 @@ public class CompletedFetch {
                 maybeEnsureValid(fetchConfig, currentBatch);
 
                 if (fetchConfig.isolationLevel == IsolationLevel.READ_COMMITTED && currentBatch.hasProducerId()) {
-                    // remove from the aborted transaction queue all aborted transactions which have begun
-                    // before the current batch's last offset and add the associated producerIds to the
-                    // aborted producer set
+                    // [read_committed 필터링 - 배치 단위 처리]
+                    // 배치를 꺼낼 때마다 3단계로 처리한다:
+                    //
+                    // Step 1 (consumeAbortedTransactionsUpTo): abortedTransactions PQ에서
+                    //   firstOffset <= currentBatch.lastOffset() 인 항목을 pop해
+                    //   abortedProducerIds Set에 추가한다 (lazy 활성화).
+                    //
+                    // Step 2a (containsAbortMarker): 이 배치가 ABORT control batch이면
+                    //   해당 producerId를 abortedProducerIds에서 제거한다 (트랜잭션 종료 처리).
+                    //   같은 producerId로 새 트랜잭션이 열려도 잘못 skip하지 않기 위함.
+                    //
+                    // Step 2b (isBatchAborted): 데이터 배치이고 producerId가 abortedProducerIds에
+                    //   있으면 배치 전체를 skip한다 (유저에게 전달되지 않음).
                     consumeAbortedTransactionsUpTo(currentBatch.lastOffset());
 
                     long producerId = currentBatch.producerId();
@@ -227,6 +251,8 @@ public class CompletedFetch {
                     maybeEnsureValid(fetchConfig, record);
 
                     // control records are not returned to the user
+                    // COMMIT/ABORT 마커 배치는 유저에게 반환하지 않는다.
+                    // (read_committed 여부와 무관하게 모든 control batch를 숨김)
                     if (!currentBatch.isControlBatch()) {
                         return record;
                     } else {
@@ -348,6 +374,14 @@ public class CompletedFetch {
         return leaderEpoch == RecordBatch.NO_PARTITION_LEADER_EPOCH ? Optional.empty() : Optional.of(leaderEpoch);
     }
 
+    /**
+     * abortedTransactions PQ에서 firstOffset <= offset 인 항목을 꺼내 abortedProducerIds에 추가한다.
+     *
+     * <p>이 메서드는 배치를 순서대로 읽을 때마다 호출되며, "이 배치의 lastOffset 시점까지 시작된"
+     * abort 트랜잭션을 lazy하게 활성화한다. 전체 목록을 미리 Set에 넣지 않고 PQ에서 필요한 시점에만
+     * pop하는 이유는, 아직 읽지 않은 구간의 트랜잭션을 미리 활성화해 데이터 배치를 잘못 skip하는
+     * 것을 방지하기 위함이다.
+     */
     private void consumeAbortedTransactionsUpTo(long offset) {
         if (abortedTransactions == null)
             return;
@@ -358,10 +392,32 @@ public class CompletedFetch {
         }
     }
 
+    /**
+     * 이 배치를 skip해야 하는지(abort된 배치인지) 판단한다.
+     *
+     * <p>두 조건이 모두 충족될 때만 true를 반환한다:
+     * <ol>
+     *   <li>{@code isTransactional()} - 트랜잭션 배치여야 한다 (non-transactional 배치는 항상 소비).</li>
+     *   <li>{@code abortedProducerIds.contains(producerId)} - 이 배치의 producerId가 현재
+     *       "abort 진행 중" 집합에 포함되어 있어야 한다.</li>
+     * </ol>
+     * control batch(ABORT 마커 등)는 {@link #nextFetchedRecord} 에서 먼저 분기되므로
+     * 이 메서드에 도달하지 않는다.
+     */
     private boolean isBatchAborted(RecordBatch batch) {
         return batch.isTransactional() && abortedProducerIds.contains(batch.producerId());
     }
 
+    /**
+     * FetchResponse의 abortedTransactions 목록을 firstOffset 기준 오름차순 min-heap으로 만든다.
+     *
+     * <p>min-heap을 사용하는 이유: 배치를 offset 오름차순으로 순회하면서,
+     * "현재 배치의 lastOffset까지 시작된" abort 트랜잭션만 그때그때 pop하면 되기 때문이다.
+     * 이렇게 하면 전체 목록을 매 배치마다 스캔하지 않고 O(log n) 으로 처리할 수 있다.
+     *
+     * <p>abortedTransactions가 없으면 null을 반환하며, 이후 {@link #consumeAbortedTransactionsUpTo}에서
+     * null 체크로 early return된다.
+     */
     private PriorityQueue<FetchResponseData.AbortedTransaction> abortedTransactions(FetchResponseData.PartitionData partition) {
         if (partition.abortedTransactions() == null || partition.abortedTransactions().isEmpty())
             return null;
@@ -373,6 +429,16 @@ public class CompletedFetch {
         return abortedTransactions;
     }
 
+    /**
+     * 이 배치가 ABORT control record를 담고 있는지 확인한다.
+     *
+     * <p>ABORT 마커 배치를 만나면 {@link #nextFetchedRecord}에서 이 메서드를 호출해
+     * 해당 producerId를 abortedProducerIds에서 제거한다. 이렇게 해야 같은 producerId로
+     * 이후에 새 트랜잭션이 시작되더라도 잘못 skip하지 않는다.
+     *
+     * <p>판별 방법: control batch의 첫 번째 레코드 key를 {@link ControlRecordType#parse}로 읽어
+     * {@link ControlRecordType#ABORT}와 비교한다.
+     */
     private boolean containsAbortMarker(RecordBatch batch) {
         if (!batch.isControlBatch())
             return false;

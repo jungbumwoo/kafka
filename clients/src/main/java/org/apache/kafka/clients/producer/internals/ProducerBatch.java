@@ -397,6 +397,7 @@ public final class ProducerBatch {
             int sequence = baseSequence();
             ProducerIdAndEpoch producerIdAndEpoch = new ProducerIdAndEpoch(producerId(), producerEpoch());
             for (ProducerBatch newBatch : batches) {
+                // jb: record batch에 transactional.id 여부에 따라 transaction 여부 인지 header에 셋팅됨.
                 newBatch.setProducerState(producerIdAndEpoch, sequence, isTransactional());
                 sequence += newBatch.recordCount;
             }
