@@ -283,6 +283,9 @@ class TransactionCoordinator(txnConfig: TransactionConfig,
           }
 
         case TransactionState.ONGOING =>
+          // jb: producer에서 이미 해당 transaction.id가 ONGOING 상태일 때. 기존 transaction 은 abort 시키고 ConcurrentTransaction Error를 준 후
+          // client가 다시 재시도하게 만듬.
+
           // indicate to abort the current ongoing txn first. Note that this epoch is never returned to the
           // user. We will abort the ongoing transaction and return CONCURRENT_TRANSACTIONS to the client.
           // This forces the client to retry, which will ensure that the epoch is bumped a second time. In

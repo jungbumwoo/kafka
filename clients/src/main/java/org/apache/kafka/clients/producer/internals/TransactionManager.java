@@ -1724,6 +1724,7 @@ public class TransactionManager {
                     reenqueue();
                     return;
                 } else if (error == Errors.CONCURRENT_TRANSACTIONS) {
+                    // jb: 서버에서는 기존 transaction을 정리하고 concurrent transaction 응답을 준거라 다시 재시도로 처리하게 됨.
                     maybeOverrideRetryBackoffMs();
                     reenqueue();
                     return;
