@@ -339,7 +339,8 @@ public class TransactionMetadata {
 
     /**
      * Check if this is a distributed two phase commit transaction.
-     * Such transactions have no timeout (identified by maximum value for timeout).
+     * Such transactions are tagged by InitProducerId with Integer.MAX_VALUE so Kafka can recognize
+     * that timeout-based cleanup must be skipped and an external coordinator owns completion.
      */
     public boolean isDistributedTwoPhaseCommitTxn() {
         return txnTimeoutMs == Integer.MAX_VALUE;

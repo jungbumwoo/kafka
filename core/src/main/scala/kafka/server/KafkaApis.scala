@@ -1592,6 +1592,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
   }
 
+  // jb: handleInitProducerIdRequest server에서 받았을 때.
   def handleInitProducerIdRequest(request: RequestChannel.Request, requestLocal: RequestLocal): Unit = {
     val initProducerIdRequest = request.body[InitProducerIdRequest]
     val transactionalId = initProducerIdRequest.data.transactionalId
@@ -1641,6 +1642,8 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     producerIdAndEpoch match {
       case Right(producerIdAndEpoch) =>
+        // The InitProducerId request carries the client's 2PC intent, which is forwarded unchanged
+        // to TransactionCoordinator so it can choose the distributed-2PC initialization path.
         val enableTwoPC = initProducerIdRequest.enable2Pc()
         val keepPreparedTxn = initProducerIdRequest.keepPreparedTxn()
 

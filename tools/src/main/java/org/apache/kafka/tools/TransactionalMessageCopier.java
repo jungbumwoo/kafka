@@ -224,6 +224,10 @@ public class TransactionalMessageCopier {
         return new ProducerRecord<>(topic, record.partition(), record.key(), record.value());
     }
 
+    /**
+     * Capture the next offset for every assigned partition so the producer can commit
+     * those offsets as part of the same transaction as the output records.
+     */
     private static Map<TopicPartition, OffsetAndMetadata> consumerPositions(KafkaConsumer<String, String> consumer) {
         Map<TopicPartition, OffsetAndMetadata> positions = new HashMap<>();
         for (TopicPartition topicPartition : consumer.assignment()) {
@@ -232,6 +236,10 @@ public class TransactionalMessageCopier {
         return positions;
     }
 
+    /**
+     * Rewind the consumer to the last committed offsets after an abort so the next poll
+     * re-reads the same input records that were part of the failed transaction.
+     */
     private static void resetToLastCommittedPositions(KafkaConsumer<String, String> consumer) {
         final Map<TopicPartition, OffsetAndMetadata> committed = consumer.committed(consumer.assignment());
         consumer.assignment().forEach(tp -> {
@@ -284,6 +292,7 @@ public class TransactionalMessageCopier {
         KafkaProducer<String, String> producer,
         KafkaConsumer<String, String> consumer
     ) {
+        // The output records and the consumed offsets must be rolled back together.
         producer.abortTransaction();
         resetToLastCommittedPositions(consumer);
     }
@@ -347,6 +356,8 @@ public class TransactionalMessageCopier {
 
         final boolean enableRandomAborts = parsedArgs.getBoolean("enableRandomAborts");
 
+        // initTransactions() resolves any previous unfinished work for the transactional.id
+        // and fences off older producers that might still be using the same id.
         producer.initTransactions();
 
         final AtomicBoolean isShuttingDown = new AtomicBoolean(false);
@@ -378,6 +389,8 @@ public class TransactionalMessageCopier {
                 ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(200));
                 if (records.count() > 0) {
                     try {
+                        // A Kafka transaction groups produced records and consumed offsets into
+                        // one atomic unit. Either both become visible, or neither does.
                         producer.beginTransaction();
 
                         for (ConsumerRecord<String, String> record : records) {
@@ -386,12 +399,18 @@ public class TransactionalMessageCopier {
 
                         long messagesSentWithinCurrentTxn = records.count();
 
+                        // The offsets written here represent "all records up to this position
+                        // were processed successfully by this transaction".
                         ConsumerGroupMetadata groupMetadata = useGroupMetadata ? consumer.groupMetadata() : new ConsumerGroupMetadata(consumerGroup);
                         producer.sendOffsetsToTransaction(consumerPositions(consumer), groupMetadata);
 
                         if (enableRandomAborts && random.nextInt() % 3 == 0) {
+                            // System tests use forced aborts to verify that consumers only observe
+                            // committed records and that replay starts from the previous commit point.
                             abortTransactionAndResetPosition(producer, consumer);
                         } else {
+                            // commitTransaction() makes the output records visible to read_committed
+                            // consumers and atomically advances the consumer group offsets.
                             producer.commitTransaction();
                             remainingMessages.getAndAdd(-messagesSentWithinCurrentTxn);
                             numMessagesProcessedSinceLastRebalance.getAndAdd(messagesSentWithinCurrentTxn);
@@ -401,6 +420,8 @@ public class TransactionalMessageCopier {
                         throw new KafkaException(String.format("The transactional.id %s has been claimed by another process", transactionalId), e);
                     } catch (KafkaException e) {
                         log.debug("Aborting transaction after catching exception", e);
+                        // Any error after beginTransaction() must be followed by abort to avoid
+                        // leaving a partially completed transaction open on the broker.
                         abortTransactionAndResetPosition(producer, consumer);
                     }
                 }

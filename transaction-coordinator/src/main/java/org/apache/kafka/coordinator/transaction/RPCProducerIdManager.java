@@ -78,6 +78,8 @@ public class RPCProducerIdManager implements ProducerIdManager {
     }
 
 
+    // jb 여기 발급 받는 방식 흥미로움. controller에서 id를 발급.
+    // 발급 로직이 최적화되어있음. batch 단위로 미리 발급 받고, 특정 임계값에 도달하면 미리 block 단위로 발급 받아오도록 되어있다.
     @Override
     public long generateProducerId() {
         var iteration = 0;

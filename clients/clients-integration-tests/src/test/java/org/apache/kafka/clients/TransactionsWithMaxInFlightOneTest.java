@@ -86,14 +86,20 @@ public class TransactionsWithMaxInFlightOneTest {
             ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 1
         ))
         ) {
+            // Initializes the transactional producer state and recovers any unfinished
+            // transaction for this transactional.id before new work begins.
             producer.initTransactions();
 
+            // First transaction is explicitly aborted. The records are written to the log,
+            // but read_committed consumers must never observe them.
             producer.beginTransaction();
             producer.send(new ProducerRecord<>(TOPIC2, null, "2".getBytes(), "2".getBytes(), Collections.singleton(new RecordHeader(HEADER_KEY, ABORTED_VALUE))));
             producer.send(new ProducerRecord<>(TOPIC1, null, "4".getBytes(), "4".getBytes(), Collections.singleton(new RecordHeader(HEADER_KEY, ABORTED_VALUE))));
             producer.flush();
             producer.abortTransaction();
 
+            // Second transaction is committed, so only these records should be visible
+            // to consumers running with isolation.level=read_committed.
             producer.beginTransaction();
             producer.send(new ProducerRecord<>(TOPIC1, null, "1".getBytes(), "1".getBytes(), Collections.singleton(new RecordHeader(HEADER_KEY, COMMITTED_VALUE))));
             producer.send(new ProducerRecord<>(TOPIC2, null, "3".getBytes(), "3".getBytes(), Collections.singleton(new RecordHeader(HEADER_KEY, COMMITTED_VALUE))));
@@ -104,6 +110,8 @@ public class TransactionsWithMaxInFlightOneTest {
                 try (Consumer<byte[], byte[]> consumer = clusterInstance.consumer(Map.of(
                         ConsumerConfig.GROUP_PROTOCOL_CONFIG, groupProtocol.name(),
                         ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false",
+                        // read_committed hides aborted transactional writes and only returns
+                        // records whose enclosing transaction has been committed.
                         ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed"
                     )
                 )) {

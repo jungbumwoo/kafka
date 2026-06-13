@@ -137,7 +137,8 @@ class TransactionStateManager(brokerId: Int,
           } else {
             txnMetadata.state match {
               case TransactionState.ONGOING =>
-                // Do not apply timeout to distributed two phase commit transactions.
+                // 2PC transactions use Int.MaxValue as a sentinel timeout because an external coordinator,
+                // not Kafka's timeout scanner, is responsible for driving them to commit or abort.
                 (!txnMetadata.isDistributedTwoPhaseCommitTxn) &&
                 (txnMetadata.txnStartTimestamp + txnMetadata.txnTimeoutMs < now)
               case _ => false
@@ -427,6 +428,8 @@ class TransactionStateManager(brokerId: Int,
    * @return `true` if the timeout is valid, `false` otherwise.
    */
   def validateTransactionTimeoutMs(enableTwoPC: Boolean, txnTimeoutMs: Int): Boolean = {
+    // For distributed 2PC, the client timeout is not enforced by Kafka because the transaction lifetime
+    // is managed by an external transaction coordinator.
     enableTwoPC || (txnTimeoutMs <= config.transactionMaxTimeoutMs && txnTimeoutMs > 0)
   }
 

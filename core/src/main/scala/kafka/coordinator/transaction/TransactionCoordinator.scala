@@ -122,6 +122,7 @@ class TransactionCoordinator(txnConfig: TransactionConfig,
       // if the transactional id is null, then always blindly accept the request
       // and return a new producerId from the producerId manager
       try {
+        // jb 0607 여기까지 읽음.
         responseCallback(InitProducerIdResult(producerIdManager.generateProducerId(), producerEpoch = 0, Errors.NONE))
       } catch {
         case e: Exception => responseCallback(initTransactionError(Errors.forException(e)))
@@ -143,8 +144,13 @@ class TransactionCoordinator(txnConfig: TransactionConfig,
       // check transactionTimeoutMs is not larger than the broker configured maximum allowed value
       responseCallback(initTransactionError(Errors.INVALID_TRANSACTION_TIMEOUT))
     } else {
+      // Distributed 2PC transactions are controlled by an external coordinator, so Kafka records them
+      // with a sentinel timeout value instead of enforcing the client-provided timeout locally.
       val resolvedTxnTimeoutMs = if (enableTwoPCFlag) Int.MaxValue else transactionTimeoutMs
+
+      // jb: transaction state 조회, 없으면 생성
       val coordinatorEpochAndMetadata = txnManager.getTransactionState(transactionalId).flatMap {
+        // 없으면 생성
         case None =>
           try {
             val createdMetadata = new TransactionMetadata(transactionalId,
@@ -164,6 +170,7 @@ class TransactionCoordinator(txnConfig: TransactionConfig,
             case e: Exception => Left(Errors.forException(e))
           }
 
+        // 있으면 그대로 사용
         case Some(epochAndTxnMetadata) => Right(epochAndTxnMetadata)
       }
 
