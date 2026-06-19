@@ -417,7 +417,11 @@ public abstract class AbstractCoordinator implements Closeable {
             return false;
         }
 
+        // [CLIENT-1] 리밸런스 시작점: ConsumerCoordinator.poll() → ensureActiveGroup() 순으로 진입.
+        // 하트비트 스레드가 아직 시작되지 않은 경우 시작한다(최초 1회만 생성됨).
         startHeartbeatThreadIfNeeded();
+        // [CLIENT-1→2] JoinGroup → SyncGroup 흐름을 통해 그룹에 합류하고 파티션 할당을 받는다.
+        // 내부에서 onJoinPrepare(revoke) → sendJoinGroupRequest → onJoinComplete(assign) 순으로 진행된다.
         return joinGroupIfNeeded(timer);
     }
 
@@ -476,6 +480,9 @@ public abstract class AbstractCoordinator implements Closeable {
                 // exception, in which case upon retry we should not retry onJoinPrepare either.
                 needsJoinPrepare = false;
                 // return false when onJoinPrepare is waiting for committing offset
+                // [CLIENT-2] onJoinPrepare: EAGER 방식이면 현재 보유한 모든 파티션을 revoke하고 오프셋을 커밋한다.
+                // COOPERATIVE 방식이면 더 이상 구독하지 않는 파티션만 revoke한다.
+                // → ConsumerCoordinator.onJoinPrepare()에서 실제 revoke 콜백 실행.
                 if (!onJoinPrepare(timer, generation.generationId, generation.memberId)) {
                     needsJoinPrepare = true;
                     //should not initiateJoinGroup if needsJoinPrepare still is true
@@ -483,6 +490,9 @@ public abstract class AbstractCoordinator implements Closeable {
                 }
             }
 
+            // [CLIENT-3] JoinGroup 요청을 전송하고 리밸런스 결과(파티션 할당 ByteBuffer)를 future로 받는다.
+            // 내부적으로 JoinGroupResponseHandler → (리더면) onLeaderElected → SyncGroup,
+            //                                      (팔로워면) onJoinFollower → SyncGroup 순으로 진행된다.
             final RequestFuture<ByteBuffer> future = initiateJoinGroup();
             client.poll(future, timer);
             if (!future.isDone()) {
@@ -568,6 +578,8 @@ public abstract class AbstractCoordinator implements Closeable {
         // rebalance in the call to poll below. This ensures that we do not mistakenly attempt
         // to rejoin before the pending rebalance has completed.
         if (joinFuture == null) {
+            // [CLIENT-3a] 클라이언트 상태를 PREPARING_REBALANCE로 전환한다.
+            // 이 상태에서 하트비트 스레드가 진행 중인 리밸런스 중에도 세션을 유지해 준다.
             state = MemberState.PREPARING_REBALANCE;
             // a rebalance can be triggered consecutively if the previous one failed,
             // in this case we would not update the start time.
@@ -640,6 +652,13 @@ public abstract class AbstractCoordinator implements Closeable {
             super(generation);
         }
 
+        /**
+         * [CLIENT-4] JoinGroup 응답 처리:
+         * - 성공 시: 코디네이터가 리더를 선출한다.
+         *   - 리더(isLeader==true): 전체 멤버 목록을 받아 클라이언트 측 할당 알고리즘 실행 후 SyncGroup 전송
+         *   - 팔로워: 빈 SyncGroup을 전송하고 코디네이터가 할당을 내려줄 때까지 대기
+         * - 에러 시: 에러 유형에 따라 즉시 재시도, 백오프 후 재시도, 또는 치명적 예외를 던진다.
+         */
         @Override
         public void handle(JoinGroupResponse joinResponse, RequestFuture<ByteBuffer> future) {
             Errors error = joinResponse.error();
@@ -658,6 +677,8 @@ public abstract class AbstractCoordinator implements Closeable {
                             // the group. In this case, we do not want to continue with the sync group.
                             future.raise(new UnjoinedGroupException());
                         } else {
+                            // [CLIENT-4a] JoinGroup 성공: 상태를 COMPLETING_REBALANCE로 전환하고
+                            // 하트비트 스레드를 활성화한다 (세션 유지 목적).
                             state = MemberState.COMPLETING_REBALANCE;
 
                             // we only need to enable heartbeat thread whenever we transit to
@@ -674,8 +695,10 @@ public abstract class AbstractCoordinator implements Closeable {
                                 Collections.singletonMap(ClientTelemetryProvider.GROUP_MEMBER_ID, joinResponse.data().memberId())));
 
                             if (joinResponse.isLeader()) {
+                                // [CLIENT-5a] 리더: ConsumerCoordinator.onLeaderElected()에서 assignor.assign() 실행 후 SyncGroup 전송.
                                 onLeaderElected(joinResponse).chain(future);
                             } else {
+                                // [CLIENT-5b] 팔로워: 빈 SyncGroup을 전송하고 코디네이터가 할당을 배포할 때까지 future를 park.
                                 onJoinFollower().chain(future);
                             }
                         }
@@ -751,6 +774,8 @@ public abstract class AbstractCoordinator implements Closeable {
     }
 
     private RequestFuture<ByteBuffer> onJoinFollower() {
+        // [CLIENT-6b] 팔로워: assignments = [] 인 빈 SyncGroup을 전송한다.
+        // 코디네이터가 리더의 SyncGroup을 받아 할당을 결정하고 이 future를 완료시킬 때까지 대기한다.
         // send follower's sync group with an empty assignment
         SyncGroupRequest.Builder requestBuilder =
                 new SyncGroupRequest.Builder(
@@ -769,6 +794,8 @@ public abstract class AbstractCoordinator implements Closeable {
 
     private RequestFuture<ByteBuffer> onLeaderElected(JoinGroupResponse joinResponse) {
         try {
+            // [CLIENT-5a→6a] 리더 경로: ConsumerCoordinator.onLeaderElected()를 통해 assignor.assign() 실행 후
+            // 전체 멤버 할당 Map을 SyncGroup 요청에 담아 코디네이터로 전송한다.
             // perform the leader synchronization and send back the assignment for the group
             Map<String, ByteBuffer> groupAssignment = onLeaderElected(
                 joinResponse.data().leader(),
@@ -820,6 +847,13 @@ public abstract class AbstractCoordinator implements Closeable {
             super(generation);
         }
 
+        /**
+         * [CLIENT-7] SyncGroup 응답 처리:
+         * - 성공 시: 코디네이터가 리더로부터 받은 할당 결과를 이 멤버에게 전달한다.
+         *   state → STABLE 전환, 리밸런스 지연 시간 기록, future에 assignment ByteBuffer를 완료시킨다.
+         *   이후 joinGroupIfNeeded()에서 onJoinComplete()가 호출되어 onPartitionsAssigned() 실행된다.
+         * - REBALANCE_IN_PROGRESS: SyncGroup 대기 중 또 다른 리밸런스가 시작됨 → 즉시 재시도.
+         */
         @Override
         public void handle(SyncGroupResponse syncResponse,
                            RequestFuture<ByteBuffer> future) {
@@ -847,6 +881,9 @@ public abstract class AbstractCoordinator implements Closeable {
                                 future.raise(Errors.INCONSISTENT_GROUP_PROTOCOL);
                             } else {
                                 log.info("Successfully synced group in generation {}", generation);
+                                // [CLIENT-7a] SyncGroup 성공: 상태를 STABLE로 전환하고 future를 완료한다.
+                                // joinGroupIfNeeded()의 루프에서 future.succeeded()를 감지하고
+                                // onJoinComplete()를 호출하여 [CLIENT-8] 단계로 진행된다.
                                 state = MemberState.STABLE;
                                 rejoinReason = "";
                                 rejoinNeeded = false;
@@ -1479,6 +1516,10 @@ public abstract class AbstractCoordinator implements Closeable {
         public void run() {
             try {
                 log.debug("Heartbeat thread started");
+                // [CLIENT-HB] 하트비트 스레드 메인 루프: 별도 스레드에서 실행되며 코디네이터에 주기적으로 Heartbeat를 전송한다.
+                // 세션 타임아웃(session.timeout.ms) 내에 하트비트가 도달하지 않으면 코디네이터가 멤버를 제거하고
+                // 리밸런스를 시작한다. 이 스레드는 폴링 스레드와 독립적으로 동작하여 poll() 호출 간격에 관계없이
+                // 세션을 유지한다.
                 while (true) {
                     synchronized (AbstractCoordinator.this) {
                         if (isClosed())
@@ -1513,11 +1554,15 @@ public abstract class AbstractCoordinator implements Closeable {
                         } else if (heartbeat.sessionTimeoutExpired(now)) {
                             // the session timeout has expired without seeing a successful heartbeat, so we should
                             // probably make sure the coordinator is still healthy.
+                            // session.timeout.ms 내에 하트비트 응답이 없으면 코디네이터를 unknown으로 표시하고
+                            // FindCoordinator 요청으로 재탐색을 시작한다.
                             markCoordinatorUnknown("session timed out without receiving a "
                                     + "heartbeat response");
                         } else if (heartbeat.pollTimeoutExpired(now)) {
                             // the poll timeout has expired, which means that the foreground thread has stalled
                             // in between calls to poll().
+                            // max.poll.interval.ms 초과: 메인 스레드가 poll()을 호출하지 않아 멤버가 "liveness"를
+                            // 잃은 것으로 판단한다. LeaveGroup을 전송하고 그룹에서 탈퇴를 처리한다.
                             handlePollTimeoutExpiry();
                         } else if (!heartbeat.shouldHeartbeat(now)) {
                             // poll again after waiting for the retry backoff in case the heartbeat failed or the
@@ -1525,6 +1570,7 @@ public abstract class AbstractCoordinator implements Closeable {
                             // exponential backoff.
                             AbstractCoordinator.this.wait(rebalanceConfig.retryBackoffMs);
                         } else {
+                            // 하트비트 전송 시점: heartbeat.interval.ms 간격으로 Heartbeat 요청을 전송한다.
                             heartbeat.sentHeartbeat(now);
                             final RequestFuture<Void> heartbeatFuture = sendHeartbeatRequest();
                             heartbeatFuture.addListener(new RequestFutureListener<>() {

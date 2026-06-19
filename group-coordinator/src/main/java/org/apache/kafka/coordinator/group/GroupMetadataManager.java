@@ -6202,6 +6202,8 @@ public class GroupMetadataManager {
         JoinGroupRequestData request,
         CompletableFuture<JoinGroupResponseData> responseFuture
     ) {
+        // [SERVER-1] Classic 그룹 JoinGroup 요청 진입점 (GroupCoordinator → GroupMetadataManager 호출).
+        // 그룹 타입에 따라 classicGroupJoinToClassicGroup() 또는 classicGroupJoinToConsumerGroup()으로 분기한다.
         Group group = groups.get(request.groupId(), Long.MAX_VALUE);
         if (group != null) {
             if (group.type() == CONSUMER && !group.isEmpty()) {
@@ -6241,6 +6243,12 @@ public class GroupMetadataManager {
         JoinGroupRequestData request,
         CompletableFuture<JoinGroupResponseData> responseFuture
     ) {
+        // [SERVER-1a] Classic 그룹 JoinGroup 요청 처리 (서버 측).
+        // - 새 멤버(UNKNOWN_MEMBER_ID): 멤버를 생성하고 그룹에 추가한다.
+        // - 기존 멤버: 이미 합류한 멤버의 메타데이터를 갱신한다.
+        // 두 경우 모두 그룹 상태가 STABLE·COMPLETING_REBALANCE이면 PREPARING_REBALANCE로 전환
+        // (prepareRebalance 호출)하여 다른 멤버들도 재참여하도록 유도한다.
+        // responseFuture는 즉시 완료되지 않고 completeClassicGroupJoin()이 호출될 때 완료된다.
         CoordinatorResult<Void, CoordinatorRecord> result = EMPTY_RESULT;
         List<CoordinatorRecord> records = new ArrayList<>();
 
@@ -6683,6 +6691,15 @@ public class GroupMetadataManager {
     private CoordinatorResult<Void, CoordinatorRecord> completeClassicGroupJoin(
         ClassicGroup group
     ) {
+        // [SERVER-3] PREPARING_REBALANCE 타이머 만료 시 호출: JoinGroup 단계를 완료하고 SyncGroup 단계로 전환.
+        // 1) JoinGroup을 재전송하지 않은 동적 멤버를 그룹에서 제거한다.
+        // 2) 리더를 선출한다(maybeElectNewJoinedLeader): 합류한 멤버 중 첫 번째가 리더가 된다.
+        // 3) group.initNextGeneration(): generationId를 증가시키고 PREPARING_REBALANCE → COMPLETING_REBALANCE 전환.
+        // 4) 모든 합류 멤버에게 JoinGroup responseFuture를 완료(unpark)한다:
+        //    - 리더: 전체 멤버 목록 포함 (클라이언트 측 할당 알고리즘에 필요)
+        //    - 팔로워: 빈 멤버 목록
+        //    클라이언트는 이 응답을 받아 [CLIENT-4] 단계로 진행된다.
+        // 5) schedulePendingSync(): 리더 SyncGroup을 기다리는 타이머를 예약한다.
         timer.cancel(classicGroupJoinKey(group.groupId()));
         String groupId = group.groupId();
 
@@ -6719,6 +6736,7 @@ public class GroupMetadataManager {
 
             return EMPTY_RESULT;
         } else {
+            // [SERVER-3a] generationId 증가 + 상태 전환: PREPARING_REBALANCE → COMPLETING_REBALANCE
             group.initNextGeneration();
             if (group.isInState(EMPTY)) {
                 log.info("Group {} with generation {} is now empty.", groupId, group.generationId());
@@ -6743,6 +6761,9 @@ public class GroupMetadataManager {
                 log.info("Stabilized group {} generation {} with {} members.",
                     groupId, group.generationId(), group.numMembers());
 
+                // [SERVER-3b] 모든 멤버의 park된 JoinGroup responseFuture를 완료(unpark)한다.
+                // 리더에게는 전체 멤버 목록(구독 메타데이터 포함)을 전달한다.
+                // 클라이언트는 이 응답을 받아 [CLIENT-4] JoinGroupResponseHandler로 진행된다.
                 // Complete the awaiting join group response future for all the members after rebalancing
                 group.allMembers().forEach(member -> {
                     List<JoinGroupResponseData.JoinGroupResponseMember> members = List.of();
@@ -6938,6 +6959,12 @@ public class GroupMetadataManager {
         String memberId,
         CompletableFuture<JoinGroupResponseData> responseFuture
     ) {
+        // [SERVER-1b] 멤버를 그룹에 추가하고 리밸런스를 시작하거나 조인 단계를 완료한다.
+        // 1) ClassicGroupMember 객체를 생성한다.
+        // 2) group.add(member, responseFuture): 멤버를 그룹에 추가하고 JoinGroup responseFuture를 park한다.
+        //    (이 future는 completeClassicGroupJoin()이 호출될 때 완료된다)
+        // 3) maybePrepareRebalanceOrCompleteJoin(): STABLE/COMPLETING_REBALANCE이면 prepareRebalance(),
+        //    이미 PREPARING_REBALANCE이면 maybeCompleteJoinPhase()로 진행한다.
         Optional<String> groupInstanceId = Optional.ofNullable(request.groupInstanceId());
         ClassicGroupMember member = new ClassicGroupMember(
             memberId,
@@ -7005,6 +7032,14 @@ public class GroupMetadataManager {
         ClassicGroup group,
         String reason
     ) {
+        // [SERVER-2] 서버 측에서 리밸런스를 시작하는 핵심 메서드.
+        // 그룹 상태를 PREPARING_REBALANCE로 전환하고 타이머를 예약한다:
+        // - 첫 번째 리밸런스(EMPTY): classicGroupInitialRebalanceDelayMs 지연 후 타이머 실행.
+        //   이 지연은 신규 그룹 시작 시 모든 멤버가 합류할 시간을 준다.
+        // - 이후 리밸런스: rebalanceTimeoutMs 내에 모든 기존 멤버가 JoinGroup을 재전송해야 한다.
+        //   타이머 만료 시 completeClassicGroupJoin()을 호출하여 합류한 멤버로 다음 세대를 시작한다.
+        // COMPLETING_REBALANCE 상태에서 호출되면 SyncGroup 대기 중인 멤버에게 REBALANCE_IN_PROGRESS를 돌려준다.
+
         // If any members are awaiting sync, cancel their request and have them rejoin.
         if (group.isInState(COMPLETING_REBALANCE)) {
             resetAndPropagateAssignmentWithError(group, Errors.REBALANCE_IN_PROGRESS);
@@ -7028,6 +7063,8 @@ public class GroupMetadataManager {
             );
         }
 
+        // [SERVER-2a] 서버 상태 전환: STABLE/COMPLETING_REBALANCE/EMPTY → PREPARING_REBALANCE
+        // 이후 기존 멤버들의 하트비트에 REBALANCE_IN_PROGRESS를 반환하여 JoinGroup 재전송을 유도한다.
         group.transitionTo(PREPARING_REBALANCE);
 
         log.info("Preparing to rebalance group {} in state {} with old generation {} (reason: {}).",
@@ -7479,6 +7516,12 @@ public class GroupMetadataManager {
         SyncGroupRequestData request,
         CompletableFuture<SyncGroupResponseData> responseFuture
     ) throws IllegalStateException {
+        // [SERVER-4] SyncGroup 요청 처리 (서버 측, COMPLETING_REBALANCE 상태):
+        // - 팔로워의 SyncGroup: responseFuture를 멤버에 저장(park)하고 리더 응답을 기다린다.
+        // - 리더의 SyncGroup: 요청에 포함된 전체 할당을 파싱하여 각 멤버의 awaitingSyncFuture를 완료시킨다.
+        //   동시에 그룹 메타데이터 레코드를 __consumer_offsets에 기록한다(CoordinatorRecord 반환).
+        //   이후 그룹 상태를 STABLE로 전환한다.
+        // - PREPARING_REBALANCE 상태(또 다른 리밸런스 진행 중): REBALANCE_IN_PROGRESS 오류 반환.
         String groupId = request.groupId();
         String memberId = request.memberId();
 
@@ -7531,8 +7574,13 @@ public class GroupMetadataManager {
                             maybePrepareRebalanceOrCompleteJoin(group, "Error " + error + " when storing group assignment" +
                                 "during SyncGroup (member: " + memberId + ").");
                         } else {
+                            // [SERVER-5] 리더 SyncGroup 처리: __consumer_offsets 기록 완료 후
+                            // 각 멤버에게 할당을 배포하고 상태를 STABLE로 전환한다.
                             // Update group's assignment and propagate to all members.
                             setAndPropagateAssignment(group, assignment);
+                            // [SERVER-6] 상태 전환: COMPLETING_REBALANCE → STABLE
+                            // propagateAssignment()로 모든 멤버의 SyncGroup responseFuture가 완료되어
+                            // 클라이언트들이 [CLIENT-7] SyncGroupResponseHandler로 진행된다.
                             group.transitionTo(STABLE);
                             metrics.record(CLASSIC_GROUP_COMPLETED_REBALANCES_SENSOR_NAME);
                         }

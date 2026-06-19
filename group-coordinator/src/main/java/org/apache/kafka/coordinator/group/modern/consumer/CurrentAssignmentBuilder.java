@@ -37,6 +37,38 @@ import java.util.function.BiFunction;
  * The CurrentAssignmentBuilder class encapsulates the reconciliation engine of the
  * consumer group protocol. Given the current state of a member and a desired or target
  * assignment state, the state machine takes the necessary steps to converge them.
+ *
+ * <p>KIP-848 Consumer Protocol 멤버 상태 머신 (서버 측 점진적 조정):
+ * Classic 프로토콜의 stop-the-world 방식과 달리 각 멤버가 독립적으로 조정된다.
+ *
+ * <pre>
+ *  ┌──────────────────────────────────────────────────────────────────────────┐
+ *  │  ConsumerGroupHeartbeat 수신 시 매번 build()가 호출되어 멤버 상태를 전진시킨다  │
+ *  └──────────────────────────────────────────────────────────────────────────┘
+ *
+ *  [멤버 상태 전환]
+ *
+ *  STABLE ──────────────► (새 targetAssignment 존재)
+ *                              └──► computeNextAssignment()
+ *                                        ├─ revoke 필요 → UNREVOKED_PARTITIONS
+ *                                        ├─ assign 가능 → STABLE (또는 UNRELEASED_PARTITIONS)
+ *                                        └─ 대기 중인 파티션만 있음 → UNRELEASED_PARTITIONS
+ *
+ *  UNREVOKED_PARTITIONS ─► (클라이언트가 아직 revoke 안 함) → 현재 상태 유지
+ *                         → (클라이언트가 ownedPartitions에서 제거 확인) → computeNextAssignment()
+ *
+ *  UNRELEASED_PARTITIONS → computeNextAssignment() (다른 멤버의 revoke 완료 시 할당 가능해짐)
+ *
+ *  UNKNOWN ──────────────► 멤버 펜싱 (FencedMemberEpochException), 처음부터 재조정
+ *
+ * </pre>
+ *
+ * <p>computeNextAssignment() 집합 연산:
+ * <pre>
+ *   assignedPartitions        = 현재할당 ∩ 목표할당
+ *   partitionsPendingRevocation = 현재할당 - assignedPartitions  (= 현재할당 - 목표할당)
+ *   partitionsPendingAssignment = 목표할당 - assignedPartitions - 다른멤버가_아직_보유중인파티션
+ * </pre>
  */
 public class CurrentAssignmentBuilder {
     /**
@@ -182,6 +214,15 @@ public class CurrentAssignmentBuilder {
      * Builds the next state for the member or keep the current one if it
      * is not possible to move forward with the current state.
      *
+     * <p>[MODERN-1] ConsumerGroupHeartbeat 수신 시마다 호출된다.
+     * 현재 멤버 상태(MemberState)에 따라 다음 행동을 결정하며,
+     * 불변인 ConsumerGroupMember 객체를 새로 생성하여 반환한다(기존 객체는 수정되지 않음).
+     *
+     * <p>Classic 프로토콜과의 핵심 차이:
+     * - 그룹 전체가 멈추는(stop-the-world) 대신 멤버별로 독립적으로 수렴한다.
+     * - revoke는 클라이언트가 ownedTopicPartitions에서 파티션을 제거함으로써 확인된다.
+     * - assign은 서버가 HeartbeatResponse의 assignment에 새 파티션을 포함시킴으로써 전달된다.
+     *
      * @return A new ConsumerGroupMember or the current one.
      */
     public ConsumerGroupMember build() {
@@ -191,6 +232,8 @@ public class CurrentAssignmentBuilder {
                 // epoch (or target assignment) is available. If it is, we can
                 // reconcile the member towards it. Otherwise, we ensure the
                 // assignment is consistent with the subscribed topics, if changed.
+                // [MODERN-2a] STABLE 상태: 멤버 에포크가 목표 에포크보다 낮으면 새 할당이 존재하므로 조정을 시작한다.
+                // 구독 토픽이 변경된 경우: 더 이상 구독하지 않는 토픽의 파티션을 revoke한다.
                 if (member.memberEpoch() != targetAssignmentEpoch) {
                     return computeNextAssignment(
                         member.memberEpoch(),
@@ -215,6 +258,9 @@ public class CurrentAssignmentBuilder {
 
                 // If the member provides its owned partitions. We verify if it still
                 // owns any of the revoked partitions. If it does, we cannot progress.
+                // [MODERN-2b] UNREVOKED_PARTITIONS 상태: ownedTopicPartitions에 아직 revoke 대상 파티션이 있으면 대기한다.
+                // 클라이언트가 해당 파티션을 own 목록에서 제거한 다음 하트비트를 보내야 진행할 수 있다.
+                // revoke 완료 확인 후 computeNextAssignment()로 다음 단계로 진행한다.
                 if (ownsRevokedPartitions(member.partitionsPendingRevocation())) {
                     if (hasSubscriptionChanged) {
                         return updateCurrentAssignment(
@@ -237,6 +283,8 @@ public class CurrentAssignmentBuilder {
                 // When the member is in the UNRELEASED_PARTITIONS, we reconcile the
                 // member towards the latest target assignment. This will assign any
                 // of the unreleased partitions when they become available.
+                // [MODERN-2c] UNRELEASED_PARTITIONS 상태: 다른 멤버가 아직 보유 중이던 파티션이 해제됐을 수 있으므로
+                // 매 하트비트마다 computeNextAssignment를 재시도하여 할당 가능 여부를 확인한다.
                 return computeNextAssignment(
                     member.memberEpoch(),
                     member.assignedPartitions()
@@ -357,6 +405,27 @@ public class CurrentAssignmentBuilder {
 
     /**
      * Computes the next assignment.
+     *
+     * <p>[MODERN-3] 목표 할당(targetAssignment)을 향해 한 단계씩 수렴하는 핵심 집합 연산:
+     * <ol>
+     *   <li>각 토픽에 대해 세 집합을 계산한다:
+     *     <ul>
+     *       <li>assignedPartitions = 현재할당 ∩ 목표할당 (즉시 유지 가능)</li>
+     *       <li>partitionsPendingRevocation = 현재할당 - 목표할당 (클라이언트에게 revoke 요청)</li>
+     *       <li>partitionsPendingAssignment = 목표할당 - 현재할당 - 다른멤버_보유중 (즉시 할당 가능)</li>
+     *     </ul>
+     *   </li>
+     *   <li>currentPartitionEpoch 함수로 파티션이 다른 멤버에 의해 아직 보유됐는지 확인한다.
+     *       epoch != -1이면 아직 해제되지 않은 것이므로 UNRELEASED 처리.</li>
+     *   <li>결과에 따라 다음 상태를 결정한다:
+     *     <ul>
+     *       <li>revoke 필요 → UNREVOKED_PARTITIONS (에포크 유지, 클라이언트가 revoke 확인할 때까지 대기)</li>
+     *       <li>assign 가능 (+ 미해제 파티션 있음) → UNRELEASED_PARTITIONS (에포크 전진, 해제 대기)</li>
+     *       <li>assign 가능 (미해제 없음) → STABLE (에포크 전진, 조정 완료)</li>
+     *       <li>assign할 것 없고 미해제만 있음 → UNRELEASED_PARTITIONS</li>
+     *     </ul>
+     *   </li>
+     * </ol>
      *
      * @param memberEpoch               The epoch of the member to use. This may be different
      *                                  from the epoch in {@link CurrentAssignmentBuilder#member}.

@@ -23,6 +23,43 @@ import java.util.Set;
 /**
  * Represents all states that a classic group can be in, as well as the states that a group must
  * be in to transition to a particular state.
+ *
+ * <p>Classic Rebalance Protocol 서버측 상태 머신 (stop-the-world 방식):
+ *
+ * <p>리밸런스 흐름과 상태 전환 매핑:
+ * <pre>
+ *   [SERVER-2]  prepareRebalance()         → 어떤 상태에서든 PREPARING_REBALANCE로 전환
+ *   [SERVER-3a] completeClassicGroupJoin() → PREPARING_REBALANCE → COMPLETING_REBALANCE (initNextGeneration())
+ *   [SERVER-6]  classicGroupSync() 리더처리 → COMPLETING_REBALANCE → STABLE (group.transitionTo(STABLE))
+ * </pre>
+ *
+ * <pre>
+ *                     new member joins / leader rejoins / metadata change
+ *                              │
+ *              ┌───────────────▼────────────────┐
+ *              │       PREPARING_REBALANCE       │◄──────────────────────────────────────┐
+ *              │  - 모든 멤버로부터 JoinGroup 대기  │                                       │
+ *              │  - 하트비트에 REBALANCE_IN_PROGRESS│                                       │
+ *              └───────────────┬────────────────┘                                       │
+ *                              │ rebalanceTimeout 만료 또는 모든 멤버 합류                 │
+ *              ┌───────────────▼────────────────┐                                       │
+ *              │      COMPLETING_REBALANCE       │   new member / leave / heartbeat fail │
+ *              │  - 리더로부터 SyncGroup(assignment)│ ──────────────────────────────────────
+ *              │    대기; 팔로워 SyncGroup은 park  │
+ *              └───────────────┬────────────────┘
+ *                              │ 리더 SyncGroup 수신
+ *              ┌───────────────▼────────────────┐
+ *              │             STABLE              │
+ *              │  - 정상 하트비트/소비 동작        │
+ *              └───────────────┬────────────────┘
+ *                              │ 모든 멤버 탈퇴
+ *              ┌───────────────▼────────────────┐   모든 offset 만료
+ *              │              EMPTY              │ ──────────────────► DEAD
+ *              └────────────────────────────────┘
+ * </pre>
+ *
+ * <p>상태 전환은 {@link #validPreviousStates}로 강제된다.
+ * 잘못된 전환 시도는 {@link org.apache.kafka.coordinator.group.classic.ClassicGroup#transitionTo}에서 예외를 발생시킨다.
  */
 public enum ClassicGroupState {
 
@@ -40,6 +77,9 @@ public enum ClassicGroupState {
      *             join group from a new member => PREPARING_REBALANCE
      *             group is removed by partition emigration => DEAD
      *             group is removed by expiration => DEAD
+     *
+     * <p>멤버가 없지만 오프셋 커밋만 사용하는 그룹도 이 상태로 시작한다.
+     * 오프셋이 모두 만료될 때까지 유지되다가 DEAD로 전환된다.
      */
     EMPTY("Empty"),
 
@@ -55,6 +95,10 @@ public enum ClassicGroupState {
      * transition: some members have joined by the timeout => COMPLETING_REBALANCE
      *             all members have left the group => EMPTY
      *             group is removed by partition emigration => DEAD
+     *
+     * <p>리밸런싱 시작 단계. 코디네이터는 rebalanceTimeout 동안 모든 멤버의 JoinGroup
+     * 요청을 수집(park)한다. 기존 멤버가 하트비트를 보내면 REBALANCE_IN_PROGRESS를 받아
+     * 다음 폴 루프에서 JoinGroup을 재전송한다. 이 상태가 "stop-the-world"의 핵심이다.
      */
     PREPARING_REBALANCE("PreparingRebalance"),
 
@@ -70,6 +114,11 @@ public enum ClassicGroupState {
      *             leave group from existing member => PREPARING_REBALANCE
      *             member failure detected => PREPARING_REBALANCE
      *             group is removed by partition emigration => DEAD
+     *
+     * <p>모든 멤버가 JoinGroup에 합류한 후의 단계. 코디네이터가 리더 멤버를 선출하고
+     * 전체 멤버 목록을 JoinGroup 응답으로 돌려준다. 리더는 클라이언트 측에서 파티션
+     * 할당 알고리즘을 수행한 뒤 SyncGroup으로 결과를 전송한다. 팔로워의 SyncGroup은
+     * 리더 SyncGroup이 도착할 때까지 park된다.
      */
     COMPLETING_REBALANCE("CompletingRebalance"),
 
@@ -86,6 +135,9 @@ public enum ClassicGroupState {
      *             leader join-group received => PREPARING_REBALANCE
      *             follower join-group with new metadata => PREPARING_REBALANCE
      *             group is removed by partition emigration => DEAD
+     *
+     * <p>파티션 할당이 완료되어 정상 소비 중인 상태. 멤버 탈퇴/장애·리더 재참여·메타데이터
+     * 변경이 감지되면 즉시 PREPARING_REBALANCE로 전환된다.
      */
     STABLE("Stable"),
 

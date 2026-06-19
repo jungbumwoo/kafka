@@ -380,6 +380,13 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
                                   ByteBuffer assignmentBuffer) {
         log.debug("Executing onJoinComplete with generation {} and memberId {}", generation, memberId);
 
+        // [CLIENT-8] SyncGroup 응답으로 받은 파티션 할당을 적용하는 최종 단계 (joinGroupIfNeeded에서 호출).
+        // 1) 코디네이터가 보내준 assignment ByteBuffer를 역직렬화한다.
+        // 2) [COOPERATIVE만 해당] 이전에는 할당됐지만 새 할당에 없는 파티션을 revoke한다.
+        //    revoke가 발생하면 requestRejoin()을 즉시 호출 → 2라운드 리밸런스 시작.
+        // 3) assignor.onAssignment()로 할당자 내부 상태를 갱신한다 (e.g. StickyAssignor).
+        // 4) subscriptions.assignFromSubscribed()로 최종 파티션 할당을 적용한다.
+        // 5) ConsumerRebalanceListener.onPartitionsAssigned()를 호출하여 새 파티션을 사용자에게 알린다.
         // Only the leader is responsible for monitoring for metadata changes (i.e. partition changes)
         if (!isLeader)
             assignmentSnapshot = null;
@@ -509,6 +516,25 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
      * @return true iff the operation succeeded
      */
     public boolean poll(Timer timer, boolean waitForJoinGroup) {
+        // ╔══════════════════════════════════════════════════════════════════════════════╗
+        // ║  Classic Rebalance 전체 흐름 (EAGER 기준)                                    ║
+        // ║                                                                              ║
+        // ║  [CLIENT-1] poll() → ensureActiveGroup()                                    ║
+        // ║  [CLIENT-2]   onJoinPrepare(): 파티션 revoke + 오프셋 커밋                   ║
+        // ║  [CLIENT-3]   initiateJoinGroup() → sendJoinGroupRequest()                  ║
+        // ║                 ──── JoinGroupRequest ────► [SERVER-1] classicGroupJoin()   ║
+        // ║                                              [SERVER-2] prepareRebalance()  ║
+        // ║                                              [SERVER-3] completeClassicGroupJoin() ║
+        // ║  [CLIENT-4]   JoinGroupResponseHandler: state=COMPLETING_REBALANCE          ║
+        // ║  [CLIENT-5a]  (리더) onLeaderElected() → assignor.assign()                  ║
+        // ║  [CLIENT-5b]  (팔로워) onJoinFollower()                                     ║
+        // ║  [CLIENT-6]   sendSyncGroupRequest()                                        ║
+        // ║                 ──── SyncGroupRequest ─────► [SERVER-4] classicGroupSync()  ║
+        // ║                                              [SERVER-5] setAndPropagateAssignment() ║
+        // ║                                              [SERVER-6] group.transitionTo(STABLE)  ║
+        // ║  [CLIENT-7]   SyncGroupResponseHandler: state=STABLE                        ║
+        // ║  [CLIENT-8]   onJoinComplete(): assignment 적용 + onPartitionsAssigned()    ║
+        // ╚══════════════════════════════════════════════════════════════════════════════╝
         maybeUpdateSubscriptionMetadata();
 
         invokeCompletedOffsetCommitCallbacks();
@@ -654,6 +680,11 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
                                                       String assignmentStrategy,
                                                       List<JoinGroupResponseData.JoinGroupResponseMember> allSubscriptions,
                                                       boolean skipAssignment) {
+        // [CLIENT-5a] 코디네이터가 이 멤버를 리더로 선출했을 때 호출된다 (JoinGroupResponseHandler에서 호출).
+        // 리더만이 클라이언트 측 할당 알고리즘을 실행하는 역할을 한다.
+        // 1) 모든 멤버의 구독 정보를 역직렬화한다 (ownedPartitions 포함 - COOPERATIVE 핵심).
+        // 2) assignor.assign()을 호출하여 각 멤버에게 파티션을 할당한다.
+        // 3) 결과를 ByteBuffer로 직렬화해 반환 → SyncGroup 요청에 포함되어 서버로 전송된다.
         ConsumerPartitionAssignor assignor = lookupAssignor(assignmentStrategy);
         if (assignor == null)
             throw new IllegalStateException("Coordinator selected invalid assignment protocol: " + assignmentStrategy);
@@ -751,6 +782,13 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
     @Override
     protected boolean onJoinPrepare(Timer timer, int generation, String memberId) {
         log.debug("Executing onJoinPrepare with generation {} and memberId {}", generation, memberId);
+        // [CLIENT-2] JoinGroup 요청을 전송하기 전에 실행되는 준비 단계 (joinGroupIfNeeded에서 호출).
+        // 1) auto-commit이 활성화된 경우 오프셋을 비동기로 커밋한다 (rebalanceTimeout 내에 완료 시도).
+        // 2) 프로토콜에 따라 파티션을 revoke한다:
+        //    - EAGER: 현재 보유한 모든 파티션을 revoke → ConsumerRebalanceListener.onPartitionsRevoked() 호출
+        //             → subscriptions를 빈 집합으로 초기화 (JoinGroup 전 파티션 완전 반납)
+        //    - COOPERATIVE: 더 이상 구독하지 않는 파티션만 revoke (나머지는 유지)
+        //    - generation이 리셋된 경우: 보유 파티션을 "lost"로 처리 → onPartitionsLost() 호출
         if (joinPrepareTimer == null) {
             // We should complete onJoinPrepare before rebalanceTimeoutMs,
             // and continue to join group to avoid member got kicked out from group
@@ -916,8 +954,8 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         if (!subscriptions.hasAutoAssignedPartitions())
             return false;
 
-        // we need to rejoin if we performed the assignment and metadata has changed;
-        // also for those owned-but-no-longer-existed partitions we should drop them as lost
+        // 리더는 할당 시점의 메타데이터 스냅샷(assignmentSnapshot)을 기록한다.
+        // 현재 메타데이터(metadataSnapshot)와 다르면 새 파티션이 추가/삭제된 것이므로 재참여한다.
         if (assignmentSnapshot != null && !assignmentSnapshot.matches(metadataSnapshot)) {
             final String fullReason = String.format("cached metadata has changed from %s at the beginning of the rebalance to %s",
                 assignmentSnapshot, metadataSnapshot);
