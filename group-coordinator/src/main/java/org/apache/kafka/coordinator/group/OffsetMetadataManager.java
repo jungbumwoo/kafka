@@ -670,6 +670,7 @@ public class OffsetMetadataManager {
     }
 
     /**
+     * jb: broker side transactional offset commit method. 위는 일반 commit method
      * Handles an TxnOffsetCommit request.
      *
      * @param context The request context.
@@ -1130,6 +1131,10 @@ public class OffsetMetadataManager {
     }
 
     /**
+     * jb: 브로커가 재시작되거나, 어떤 브로커가 새로 __consumer_offsets 파티션 leader가 되면 memory에 state 상태를 복원할때 사용하는 method.
+     *  transactional offset commit이면 바로 visible 하게 만들지 않고 pendingTransactionalOffsets에 보관
+     *  tombstone(value == null)이면 해당 committed offset 상태를 삭제하는 방식으로 state를 만들어감
+     *
      * Replays OffsetCommitKey/Value to update or delete the corresponding offsets.
      *
      * @param recordOffset  The offset of the record in the log.

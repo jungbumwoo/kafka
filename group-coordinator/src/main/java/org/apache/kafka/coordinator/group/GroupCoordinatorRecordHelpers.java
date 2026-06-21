@@ -65,6 +65,32 @@ import java.util.Set;
 /**
  * This class contains helper methods to create records stored in
  * the __consumer_offsets topic.
+ *
+ * jb:
+ * coordinator가 consumer group client 들로부터 __consumer_offset 요청을 직접 받는다.
+ * controller와 coordinator가 헷깔렸는데, controller 는 cluster에 하나 있고 coordinator는 consumer group 당 하나씩 있다.
+ * 데이터는 각 leader partition 에 요청해서 받지만, offset commit의 경우에는 coordinator 에 호출한다.
+ *
+ * Q. leader parition, commit commit broker가 달라서 정합성 문제 없나?
+ * A. 있긴한데 consumer client에서 poll 요청 시에는 내부적으로 offset 갖고 있으면서 poll 요청을 하다보니 처음에 offset이 없을 때, offset 값을 가져옴
+ *
+ * The topic is a compacted changelog shared by multiple logical record types:
+ * offset commits, classic group metadata, modern consumer group metadata,
+ * share group metadata, etc. For offset commits in particular:
+ *
+ * - key   = the logical row identity: (groupId, topic, partition)
+ * - value = the payload for that row: committed offset, leader epoch,
+ *           user metadata, commit timestamp, optional expire timestamp
+ * - null value (tombstone) = delete the logical row during replay/compaction
+ *
+ * Q. compaction 시 어차피 마지막 log만 남길텐데 null 로 tomstone 남기는 이유가 뭔지 궁금하다.
+ * A. 마지막 상태가 delete 처리 된지 아닌지 알아야하니까. 마지막 log를 null로 변경하는게 아니라 append-only 동작방식이니 마지막 log에 null을 insert해서
+ * 해당 키 상태가 delete 임을 남기는 것.
+ *
+ *
+ *
+ * This means __consumer_offsets behaves more like a key-value state changelog
+ * than a user-visible append-only event log.
  */
 public class GroupCoordinatorRecordHelpers {
 
@@ -476,6 +502,7 @@ public class GroupCoordinatorRecordHelpers {
         short version = offsetCommitValueVersion(offsetAndMetadata.expireTimestampMs.isPresent());
 
         return CoordinatorRecord.record(
+            // jb: __consumer_offset topic key: (groupId, topic, partition id)
             new OffsetCommitKey()
                 .setGroup(groupId)
                 .setTopic(topic)
