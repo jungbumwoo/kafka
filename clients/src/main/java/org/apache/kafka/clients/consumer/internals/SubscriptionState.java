@@ -55,6 +55,7 @@ import static org.apache.kafka.common.requests.OffsetsForLeaderEpochResponse.UND
 import static org.apache.kafka.common.requests.OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH_OFFSET;
 
 /**
+ * jb: todo: 여기서 consumer consumer subscription state를 관리한다.
  * A class for tracking the topics, partitions, and offsets for the consumer. A partition
  * is "assigned" either directly with {@link #assignFromUser(Set)} (manual assignment)
  * or with {@link #assignFromSubscribed(Collection)} (automatic assignment from subscription).

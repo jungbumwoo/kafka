@@ -160,6 +160,8 @@ public class FetchCollector<K, V> {
             // that are not in the subscription anymore, so we make them not fetchable.
             log.debug("Not returning fetched records for assigned partition {} since it is no longer fetchable", tp);
         } else {
+            // jb: appliction에서 poll 시에는 offset을 관리하거나 요청 파라미터를 넣지 않지만,
+            // SubscriptionState에서 fetch position을 관리하고 있다.
             SubscriptionState.FetchPosition position = subscriptions.position(tp);
 
             if (position == null)
@@ -180,6 +182,7 @@ public class FetchCollector<K, V> {
                             nextInLineFetch.nextFetchOffset(),
                             nextInLineFetch.lastEpoch(),
                             position.currentLeader);
+                    // jb: 여기가 consumer in-memory에서 fetchPosition update 및 변경되는 로직
                     log.trace("Updating fetch position from {} to {} for partition {} and returning {} records from `poll()`",
                             position, nextPosition, tp, partRecords.size());
                     subscriptions.position(tp, nextPosition);
