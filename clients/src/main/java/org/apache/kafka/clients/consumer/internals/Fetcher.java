@@ -185,10 +185,15 @@ public class Fetcher<K, V> extends AbstractFetch {
                                                                     ResponseHandler<Throwable> errorHandler) {
         final List<RequestFuture<ClientResponse>> requestFutures = new ArrayList<>();
 
+        // [노드별 fetch 요청 비동기 전송]
+        // prepareFetchRequests()가 partition을 리더 노드별로 묶어 만든 Map을 순회하며,
+        // 각 브로커 노드로 독립적인 FetchRequest를 비동기로 전송한다. 응답이 오면 등록한 리스너를 통해
+        // successHandler(=handleFetchSuccess)가 호출되어 결과가 공용 FetchBuffer에 축적된다.
         for (Map.Entry<Node, FetchSessionHandler.FetchRequestData> entry : fetchRequests.entrySet()) {
             final Node fetchTarget = entry.getKey();
             final FetchSessionHandler.FetchRequestData data = entry.getValue();
             final FetchRequest.Builder request = createFetchRequest(fetchTarget, data);
+            // 실제 네트워크 전송은 여기서 큐잉되고, 이후 client.poll() 시점에 소켓으로 flush된다.
             final RequestFuture<ClientResponse> responseFuture = client.send(fetchTarget, request);
 
             responseFuture.addListener(new RequestFutureListener<>() {

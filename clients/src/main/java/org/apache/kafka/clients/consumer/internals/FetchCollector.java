@@ -89,15 +89,22 @@ public class FetchCollector<K, V> {
      * @throws TopicAuthorizationException If there is TopicAuthorization error in fetchResponse.
      */
     public Fetch<K, V> collectFetch(final FetchBuffer fetchBuffer) {
+        // [응답 집계 - 여러 브로커/파티션 결과를 하나의 Fetch로 합침]
+        // handleFetchSuccess()가 여러 브로커의 응답을 partition 단위 CompletedFetch로 FetchBuffer에 쌓아두었다.
+        // 여기서는 버퍼에서 하나씩 꺼내 역직렬화(ConsumerRecord로 변환)하고, 이를 하나의 Fetch 객체에
+        // 누적(fetch.add)하여 사용자에게 돌려줄 최종 결과를 만든다.
         final Fetch<K, V> fetch = Fetch.empty();
         final Queue<CompletedFetch> pausedCompletedFetches = new ArrayDeque<>();
+        // 한 번의 poll에서 반환할 최대 레코드 수(max.poll.records). 이 수를 채우면 집계를 멈춘다.
         int recordsRemaining = fetchConfig.maxPollRecords;
 
         try {
+            // max.poll.records를 채우거나 버퍼가 빌 때까지, 버퍼의 CompletedFetch들을 순차적으로 소비한다.
             while (recordsRemaining > 0) {
                 final CompletedFetch nextInLineFetch = fetchBuffer.nextInLineFetch();
 
                 if (nextInLineFetch == null || nextInLineFetch.isConsumed()) {
+                    // 현재 처리 중인 partition 데이터를 다 소비했으면, 버퍼에서 다음 CompletedFetch를 꺼낸다.
                     final CompletedFetch completedFetch = fetchBuffer.peek();
 
                     if (completedFetch == null)
@@ -105,6 +112,7 @@ public class FetchCollector<K, V> {
 
                     if (!completedFetch.isInitialized()) {
                         try {
+                            // 첫 사용 전 초기화(에러 코드 검사, position 검증 등).
                             fetchBuffer.setNextInLineFetch(initialize(completedFetch));
                         } catch (Exception e) {
                             // Remove a completedFetch upon a parse with exception if (1) it contains no completedFetch, and
@@ -125,10 +133,13 @@ public class FetchCollector<K, V> {
                 } else if (subscriptions.isPaused(nextInLineFetch.partition)) {
                     // when the partition is paused we add the records back to the completedFetches queue instead of draining
                     // them so that they can be returned on a subsequent poll if the partition is resumed at that time
+                    // paused된 partition은 지금 반환하지 않고 잠시 빼두었다가 finally에서 버퍼로 되돌린다.
                     log.debug("Skipping fetching records for assigned partition {} because it is paused", nextInLineFetch.partition);
                     pausedCompletedFetches.add(nextInLineFetch);
                     fetchBuffer.setNextInLineFetch(null);
                 } else {
+                    // 현재 partition에서 최대 recordsRemaining개의 레코드를 역직렬화해 꺼내온 뒤,
+                    // 최종 Fetch에 누적한다. 이렇게 여러 partition의 레코드가 하나의 Fetch로 합쳐진다.
                     final Fetch<K, V> nextFetch = fetchRecords(nextInLineFetch, recordsRemaining);
                     recordsRemaining -= nextFetch.numRecords();
                     fetch.add(nextFetch);

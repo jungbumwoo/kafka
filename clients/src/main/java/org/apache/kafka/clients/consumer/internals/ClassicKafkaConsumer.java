@@ -687,16 +687,26 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
      * @throws KafkaException if the rebalance callback throws exception
      */
     private Fetch<K, V> pollForFetches(Timer timer) {
+        // [poll 흐름 - 사용자 스레드 진입점]
+        // 사용자가 KafkaConsumer.poll(timeout)을 호출하면 최종적으로 이 메서드가 호출된다.
+        // 큰 흐름은 다음 3단계로 구성된다:
+        //   1) 이미 버퍼(FetchBuffer)에 도착해 있는 데이터가 있으면 즉시 반환 (fast path)
+        //   2) 데이터가 없으면 각 리더 브로커로 FetchRequest를 전송 (sendFetches)
+        //   3) 네트워크 응답을 기다린 뒤(client.poll), 버퍼에 쌓인 응답을 모아 반환 (collectFetch)
         long pollTimeout = coordinator == null ? timer.remainingMs() :
                 Math.min(coordinator.timeToNextPoll(timer.currentTimeMs()), timer.remainingMs());
 
-        // if data is available already, return it immediately
+        // [1단계] 이전 poll 라운드에서 이미 브로커로부터 받아 FetchBuffer에 쌓여 있는 데이터가 있으면
+        // 네트워크 왕복 없이 곧바로 반환한다. (파이프라이닝 효과 - 사용자가 데이터를 처리하는 동안
+        // 다음 fetch가 이미 백그라운드로 진행되어 왔을 수 있음)
         final Fetch<K, V> fetch = fetcher.collectFetch();
         if (!fetch.isEmpty()) {
             return fetch;
         }
 
-        // send any new fetches (won't resend pending fetches)
+        // [2단계] 새로운 fetch 요청을 전송한다. 내부적으로 partition을 "리더 브로커 노드별로 묶어서"
+        // 노드마다 하나씩 FetchRequest를 만들어 비동기로 전송한다. (이미 in-flight인 요청은 재전송하지 않음)
+        // 실제 전송/그룹핑 로직은 AbstractFetch.prepareFetchRequests() 참고.
         sendFetches();
 
         // We do not want to be stuck blocking in poll if we are missing some positions
@@ -710,6 +720,10 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
 
         log.trace("Polling for fetches with timeout {}", pollTimeout);
 
+        // [3단계] 네트워크 이벤트 루프를 돌려 각 브로커로 보낸 FetchRequest들의 응답을 기다린다.
+        // 응답이 도착하면 AbstractFetch.handleFetchSuccess() 콜백이 실행되어 파티션별 결과를
+        // CompletedFetch로 감싸 FetchBuffer에 쌓는다. hasAvailableFetches()가 true가 되면
+        // (=버퍼에 소비 가능한 데이터가 생기면) 불필요하게 더 대기하지 않고 루프를 빠져나온다.
         Timer pollTimer = time.timer(pollTimeout);
         client.poll(pollTimer, () -> {
             // since a fetch might be completed by the background thread, we need this poll condition
@@ -718,6 +732,9 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
         });
         timer.update(pollTimer.currentTimeMs());
 
+        // [최종] 여러 브로커로부터 FetchBuffer에 쌓인 응답들을 하나의 Fetch로 "모아서(aggregation)"
+        // 반환한다. 이 결과가 상위 poll()에서 ConsumerRecords로 변환되어 사용자 스레드로 반환된다.
+        // 집계 로직은 FetchCollector.collectFetch() 참고.
         return fetcher.collectFetch();
     }
 

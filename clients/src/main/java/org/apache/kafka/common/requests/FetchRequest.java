@@ -245,17 +245,26 @@ public class FetchRequest extends AbstractRequest {
 
         @Override
         public FetchRequest build(short version) {
+            // [FetchRequest 와이어 포맷(스키마) 구성]
+            // consumer가 브로커로 실제 전송하는 fetch 요청 바이트 구조(FetchRequestData)를 조립한다.
+            // 최상위(요청 전체) 레벨 필드 + topic 배열 + 각 topic 내 partition 배열의 계층 구조를 가진다.
             if (version < 3) {
                 maxBytes = DEFAULT_RESPONSE_MAX_BYTES;
             }
 
             FetchRequestData fetchRequestData = new FetchRequestData();
+            // 요청 전체 레벨 필드:
+            //   maxWaitMs : 브로커가 minBytes 만큼 데이터가 모일 때까지 최대로 대기할 시간 (fetch.max.wait.ms)
+            //   minBytes  : 응답을 돌려주기 전에 브로커가 최소로 모아야 하는 바이트 수 (fetch.min.bytes)
+            //   maxBytes  : 응답 전체의 최대 바이트 수 (fetch.max.bytes)
+            //   isolationLevel : READ_COMMITTED / READ_UNCOMMITTED (트랜잭션 메시지 가시성 제어)
             fetchRequestData.setMaxWaitMs(maxWait);
             fetchRequestData.setMinBytes(minBytes);
             fetchRequestData.setMaxBytes(maxBytes);
             fetchRequestData.setIsolationLevel(isolationLevel.id());
             fetchRequestData.setForgottenTopicsData(new ArrayList<>());
             if (version < 15) {
+                // consumer는 replicaId=-1(CONSUMER_REPLICA_ID)로 자신이 팔로워가 아님을 표시한다.
                 fetchRequestData.setReplicaId(replicaId);
             } else {
                 fetchRequestData.setReplicaState(new ReplicaState()
@@ -263,6 +272,7 @@ public class FetchRequest extends AbstractRequest {
                     .setReplicaEpoch(replicaEpoch));
             }
 
+            // incremental fetch session에서 "이제 그만 받겠다"고 브로커에 알릴 partition 목록(forgotten).
             Map<String, FetchRequestData.ForgottenTopic> forgottenTopicMap = new LinkedHashMap<>();
             addToForgottenTopicMap(removed, forgottenTopicMap);
 
@@ -277,6 +287,8 @@ public class FetchRequest extends AbstractRequest {
             forgottenTopicMap.forEach((topic, forgottenTopic) -> fetchRequestData.forgottenTopicsData().add(forgottenTopic));
 
             // We collect the partitions in a single FetchTopic only if they appear sequentially in the fetchData
+            // topic -> partition 계층으로 요청 데이터를 채운다. toFetch(Map<TopicPartition, PartitionData>)를
+            // 순회하며 같은 topic이 연속으로 나오면 하나의 FetchTopic으로 묶는다.
             fetchRequestData.setTopics(new ArrayList<>());
             FetchRequestData.FetchTopic fetchTopic = null;
             for (Map.Entry<TopicPartition, PartitionData> entry : toFetch.entrySet()) {
@@ -291,6 +303,13 @@ public class FetchRequest extends AbstractRequest {
                     fetchRequestData.topics().add(fetchTopic);
                 }
 
+                // partition 단위 요청 항목. 이것이 "poll 시 브로커로 보내는 partition별 요청 포맷"의 실체다:
+                //   partition          : partition 번호
+                //   currentLeaderEpoch : 요청 시점에 consumer가 알고 있는 리더 epoch
+                //   lastFetchedEpoch   : 직전에 받은 배치의 epoch (log divergence 감지용)
+                //   fetchOffset        : 이 partition에서 읽기 시작할 오프셋
+                //   logStartOffset     : (consumer는 보통 -1) 로그 시작 오프셋
+                //   partitionMaxBytes  : 이 partition에서 받을 최대 바이트 수
                 FetchRequestData.FetchPartition fetchPartition = new FetchRequestData.FetchPartition()
                     .setPartition(topicPartition.partition())
                     .setCurrentLeaderEpoch(partitionData.currentLeaderEpoch.orElse(RecordBatch.NO_PARTITION_LEADER_EPOCH))
@@ -303,6 +322,8 @@ public class FetchRequest extends AbstractRequest {
             }
 
             if (metadata != null) {
+                // incremental fetch session 식별자(sessionId)와 epoch. 이 값으로 브로커는 이전 요청과의
+                // 차분(delta)만 주고받아 대역폭을 절약한다(KIP-227 Incremental Fetch).
                 fetchRequestData.setSessionEpoch(metadata.epoch());
                 fetchRequestData.setSessionId(metadata.sessionId());
             }

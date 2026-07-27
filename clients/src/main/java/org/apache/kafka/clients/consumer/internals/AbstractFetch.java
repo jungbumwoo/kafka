@@ -177,6 +177,10 @@ public abstract class AbstractFetch implements Closeable {
 
             boolean needsWakeup = true;
 
+            // [브로커 응답 수집 - 노드별 응답을 partition 단위로 분해해 공용 버퍼에 축적]
+            // 하나의 브로커(fetchTarget)로부터 온 FetchResponse에는 그 노드가 리더인 여러 partition의 결과가
+            // 함께 들어 있다. 각 partition 결과를 CompletedFetch로 감싸 FetchBuffer에 넣는다.
+            // 여러 브로커의 응답이 모두 이 동일한 FetchBuffer로 모이므로, 이것이 "aggregation(집계)"의 핵심 지점이다.
             Map<TopicPartition, Metadata.LeaderIdAndEpoch> partitionsWithUpdatedLeaderInfo = new HashMap<>();
             for (Map.Entry<TopicPartition, FetchResponseData.PartitionData> entry : responseData.entrySet()) {
                 TopicPartition partition = entry.getKey();
@@ -222,6 +226,8 @@ public abstract class AbstractFetch implements Closeable {
                         partitionData,
                         metricAggregator,
                         fetchOffset);
+                // partition별 결과를 스레드 안전한 공용 버퍼에 넣는다. 사용자 스레드(collectFetch)가
+                // 이후 이 버퍼에서 꺼내 역직렬화/집계한다. add() 내부에서 대기 중인 스레드를 깨운다.
                 fetchBuffer.add(completedFetch);
                 needsWakeup = false;
             }
@@ -419,9 +425,15 @@ public abstract class AbstractFetch implements Closeable {
      * that have no existing requests in flight.
      */
     protected Map<Node, FetchSessionHandler.FetchRequestData> prepareFetchRequests() {
+        // [리더 브로커별 그룹핑 - fetch 요청 생성의 핵심]
+        // consumer에 할당된 여러 partition은 서로 다른 브로커가 리더일 수 있다. 카프카는 각 partition을
+        // 그 partition의 "리더 브로커"에서만 읽어올 수 있으므로(또는 preferred read replica),
+        // 여기서 partition들을 리더 노드(Node) 기준으로 묶어 "노드마다 하나의 FetchRequest"를 만든다.
+        // 즉, 결과 Map<Node, FetchRequestData>는 "브로커 노드 -> 그 노드로 보낼 fetch 요청" 형태다.
         // Update metrics in case there was an assignment change
         metricsManager.maybeUpdateAssignment(subscriptions);
 
+        // 노드별로 요청을 누적할 빌더 맵. computeIfAbsent로 같은 노드의 partition들을 한 빌더에 모은다.
         Map<Node, FetchSessionHandler.Builder> fetchable = new HashMap<>();
         long currentTimeMs = time.milliseconds();
         Map<String, Uuid> topicIds = metadata.topicIds();
@@ -430,6 +442,7 @@ public abstract class AbstractFetch implements Closeable {
         Set<TopicPartition> buffered = Collections.unmodifiableSet(fetchBuffer.bufferedPartitions());
 
         // This is the list of partitions that are fetchable and have no buffered data
+        // 아직 로컬 버퍼에 데이터가 없고, 새로 fetch 가능한(assigned & not paused & position 존재) partition 목록.
         List<TopicPartition> unbuffered = fetchablePartitions(buffered);
 
         if (unbuffered.isEmpty()) {
@@ -440,8 +453,11 @@ public abstract class AbstractFetch implements Closeable {
 
         Set<Integer> bufferedNodes = bufferedNodes(buffered, currentTimeMs);
 
+        // fetch 가능한 각 partition을 순회하며, 그 partition의 리더 노드를 찾아 해당 노드의 요청에 추가한다.
         for (TopicPartition partition : unbuffered) {
+            // 현재 이 partition을 어디까지 읽었는지(다음에 읽을 오프셋 등)를 담은 위치 정보.
             SubscriptionState.FetchPosition position = positionForPartition(partition);
+            // 이 position을 기준으로 실제로 요청을 보낼 노드(리더 또는 preferred read replica)를 결정.
             Optional<Node> nodeOpt = maybeNodeForPosition(partition, position, currentTimeMs);
 
             if (nodeOpt.isEmpty())
@@ -457,6 +473,7 @@ public abstract class AbstractFetch implements Closeable {
                 log.trace("Skipping fetch for partition {} because node {} is awaiting reconnect backoff", partition, node);
             } else if (nodesWithPendingFetchRequests.contains(node.id())) {
                 // If there's already an inflight request for this node, don't issue another request.
+                // 같은 노드로 이미 in-flight 요청이 있으면 중복 요청을 보내지 않는다(노드당 최대 1개의 fetch in-flight).
                 log.trace("Skipping fetch for partition {} because previous request to {} has not been processed", partition, node);
             } else if (bufferedNodes.contains(node.id())) {
                 // While a node has buffered data, don't fetch other partition data from it. Because the buffered
@@ -466,11 +483,17 @@ public abstract class AbstractFetch implements Closeable {
                 log.trace("Skipping fetch for partition {} because its leader node {} hosts buffered partitions", partition, node);
             } else {
                 // if there is a leader and no in-flight requests, issue a new fetch
+                // 해당 노드의 요청 빌더를 가져오거나(없으면 새 FetchSessionHandler로 생성) partition을 추가한다.
                 FetchSessionHandler.Builder builder = fetchable.computeIfAbsent(node, k -> {
                     FetchSessionHandler fetchSessionHandler = sessionHandlers.computeIfAbsent(node.id(), n -> new FetchSessionHandler(logContext, n));
                     return fetchSessionHandler.newBuilder();
                 });
                 Uuid topicId = topicIds.getOrDefault(partition.topic(), Uuid.ZERO_UUID);
+                // 이 partition에 대해 브로커로 보낼 요청 항목:
+                //   - fetchOffset      : 어디서부터 읽을지 (현재 consumer position)
+                //   - logStartOffset   : consumer는 알 필요 없어 INVALID(-1)로 보냄 (broker가 채움)
+                //   - fetchSize        : 이 partition에서 최대로 받을 바이트 수 (max.partition.fetch.bytes)
+                //   - currentLeaderEpoch: 리더 epoch (오래된 리더로부터의 응답을 걸러내기 위함)
                 FetchRequest.PartitionData partitionData = new FetchRequest.PartitionData(topicId,
                         position.offset,
                         FetchRequest.INVALID_LOG_START_OFFSET,
@@ -484,6 +507,7 @@ public abstract class AbstractFetch implements Closeable {
             }
         }
 
+        // 노드별로 누적된 빌더들을 실제 요청 데이터(FetchRequestData)로 변환하여 반환.
         return convert(fetchable);
     }
 
