@@ -1224,16 +1224,30 @@ class UnifiedLog(@volatile var logStartOffset: Long,
    * @throws OffsetOutOfRangeException If startOffset is beyond the log end offset or before the log start offset
    * @return The fetch data information including fetch starting offset metadata and messages read.
    */
+  // ============================================================
+  // UnifiedLog.read: 브로커 측 로그 읽기 진입점 (isolation 처리 포함)
+  //
+  // isolation(격리 수준)에 따라 읽을 수 있는 최대 offset이 달라진다:
+  //   - LOG_END (기본/follower fetch): logEndOffset까지 (아직 커밋되지 않은 것 포함)
+  //   - HIGH_WATERMARK (일반 consumer): highWatermark까지만 (ISR이 확인한 offset)
+  //   - TXN_COMMITTED (트랜잭션 consumer): lastStableOffset까지 (완료된 트랜잭션만)
+  //
+  // consumer는 기본적으로 HIGH_WATERMARK까지만 읽을 수 있다.
+  // 즉, leader에 메시지가 있어도 follower가 아직 복제하지 않았으면
+  // consumer에게 반환되지 않는다 (Kafka의 강력한 일관성 보장).
+  // ============================================================
   def read(startOffset: Long,
            maxLength: Int,
            isolation: FetchIsolation,
            minOneMessage: Boolean): FetchDataInfo = {
     checkLogStartOffset(startOffset)
+    // isolation 레벨에 따라 읽기 상한선(maxOffsetMetadata) 결정
     val maxOffsetMetadata = isolation match {
       case FetchIsolation.LOG_END => localLog.logEndOffsetMetadata
       case FetchIsolation.HIGH_WATERMARK => fetchHighWatermarkMetadata
       case FetchIsolation.TXN_COMMITTED => fetchLastStableOffsetMetadata
     }
+    // 실제 세그먼트 읽기는 LocalLog에 위임 (includeAbortedTxns는 READ_COMMITTED일 때만 true)
     localLog.read(startOffset, maxLength, minOneMessage, maxOffsetMetadata, isolation == FetchIsolation.TXN_COMMITTED)
   }
 

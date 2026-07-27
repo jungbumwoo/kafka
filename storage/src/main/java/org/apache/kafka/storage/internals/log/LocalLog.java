@@ -459,6 +459,24 @@ public class LocalLog {
      * @throws OffsetOutOfRangeException If startOffset is beyond the log end offset
      * @return The fetch data information including fetch starting offset metadata and messages read.
      */
+    // ============================================================
+    // LocalLog.read: 실제 디스크 세그먼트에서 레코드를 읽는 메서드
+    //
+    // Kafka 로그는 여러 LogSegment 파일로 구성된다 (세그먼트 단위로 분할/롤링).
+    // 각 세그먼트는 .log(실제 레코드) + .index(오프셋 인덱스) + .timeindex(타임스탬프 인덱스) 파일로 구성.
+    //
+    // 읽기 알고리즘:
+    //   1. floorSegment(startOffset): startOffset을 포함하는 세그먼트를 O(log N)으로 찾는다
+    //   2. 해당 세그먼트에서 maxLength 바이트를 읽는다
+    //   3. 데이터가 없으면 다음 세그먼트로 이동 (세그먼트 경계에 걸친 경우)
+    //   4. maxOffsetMetadata를 초과하면 빈 응답 반환 (isolation 경계 준수)
+    //
+    // 반환 타입 FetchDataInfo:
+    //   - fetchOffsetMetadata: 읽은 시작 offset의 메타데이터 (세그먼트 내 위치 포함)
+    //   - records: 실제 레코드 바이트 (MemoryRecords, zero-copy 가능)
+    //   - firstEntryIncomplete: 첫 레코드 배치가 불완전하면 true (ReplicaManager에서 빈 응답으로 대체)
+    //   - abortedTransactions: READ_COMMITTED 시 중단된 트랜잭션 목록
+    // ============================================================
     public FetchDataInfo read(long startOffset,
                        int maxLength,
                        boolean minOneMessage,
@@ -473,41 +491,52 @@ public class LocalLog {
                     }
                     LogOffsetMetadata endOffsetMetadata = nextOffsetMetadata;
                     long endOffset = endOffsetMetadata.messageOffset;
+                    // startOffset을 포함하는 세그먼트를 찾는다 (baseOffset <= startOffset인 가장 큰 세그먼트)
                     Optional<LogSegment> segmentOpt = segments.floorSegment(startOffset);
                     // return error on attempt to read beyond the log end offset
                     if (startOffset > endOffset || segmentOpt.isEmpty()) {
                         throw new OffsetOutOfRangeException("Received request for offset " + startOffset + " for partition " + topicPartition + ", " +
                                 "but we only have log segments upto " + endOffset + ".");
                     }
+                    // startOffset이 maxOffset과 같거나 크면: isolation 경계에 도달 → 빈 응답
                     if (startOffset == maxOffsetMetadata.messageOffset) return emptyFetchDataInfo(maxOffsetMetadata, includeAbortedTxns);
                     if (startOffset > maxOffsetMetadata.messageOffset) return emptyFetchDataInfo(convertToOffsetMetadataOrThrow(startOffset), includeAbortedTxns);
 
                     // Do the read on the segment with a base offset less than the target offset
                     // but if that segment doesn't contain any messages with an offset greater than that
                     // continue to read from successive segments until we get some messages or we reach the end of the log
+                    // 세그먼트 반복 읽기: 보통 한 번에 끝나지만, 세그먼트 경계에 걸치면 다음 세그먼트로 이동
                     FetchDataInfo fetchDataInfo = null;
                     while (fetchDataInfo == null && segmentOpt.isPresent()) {
                         LogSegment segment = segmentOpt.get();
                         long baseOffset = segment.baseOffset();
 
+                        // maxPosition 결정 로직 (isolation 경계를 세그먼트 파일 내 바이트 위치로 변환):
                         // 1. If `maxOffsetMetadata#segmentBaseOffset < segment#baseOffset`, then return maxPosition as empty.
                         // 2. Use the max-offset position if it is on this segment; otherwise, the segment size is the limit.
                         // 3. When maxOffsetMetadata is message-offset-only, then we don't know the relativePositionInSegment so
                         //    return maxPosition as empty to avoid reading beyond the max-offset
+                        // → maxPosition이 empty면 segment.read()가 자체적으로 상한을 결정한다
                         Optional<Long> maxPositionOpt;
                         if (segment.baseOffset() < maxOffsetMetadata.segmentBaseOffset)
+                            // 이 세그먼트는 max offset 세그먼트 이전 → 세그먼트 전체를 읽어도 됨
                             maxPositionOpt = Optional.of((long) segment.size());
                         else if (segment.baseOffset() == maxOffsetMetadata.segmentBaseOffset && !maxOffsetMetadata.messageOffsetOnly())
+                            // max offset이 이 세그먼트 내에 있고 위치 정보가 있음 → 정확한 위치까지만 읽기
                             maxPositionOpt = Optional.of((long) maxOffsetMetadata.relativePositionInSegment);
                         else
+                            // max offset 세그먼트 이후이거나 위치 정보 없음 → 상한 없이 읽기 (segment 내부에서 처리)
                             maxPositionOpt = Optional.empty();
 
+                        // 실제 세그먼트 파일에서 레코드 읽기 (FileChannel.read, 가능하면 zero-copy 사용)
                         fetchDataInfo = segment.read(startOffset, maxLength, maxPositionOpt, minOneMessage);
                         if (fetchDataInfo != null) {
+                            // READ_COMMITTED: 이 세그먼트에서 중단된 트랜잭션 정보를 추가
                             if (includeAbortedTxns) {
                                 fetchDataInfo = addAbortedTransactions(startOffset, segment, fetchDataInfo);
                             }
                         } else {
+                            // 이 세그먼트에 startOffset 이후 데이터가 없음 → 다음 세그먼트로 이동
                             segmentOpt = segments.higherSegment(baseOffset);
                         }
                     }
@@ -517,6 +546,7 @@ public class LocalLog {
                         // okay we are beyond the end of the last segment with no data fetched although the start offset is in range,
                         // this can happen when all messages with offset larger than start offsets have been deleted.
                         // In this case, we will return the empty set with log end offset metadata
+                        // startOffset 범위는 유효하지만 해당 메시지가 삭제된 경우 → 빈 응답 반환
                         return new FetchDataInfo(nextOffsetMetadata, MemoryRecords.EMPTY);
                     }
                 }

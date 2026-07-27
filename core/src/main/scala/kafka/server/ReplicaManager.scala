@@ -1644,17 +1644,28 @@ class ReplicaManager(val config: KafkaConfig,
    * the callback function will be triggered either when timeout or required fetch info is satisfied.
    * Consumers may fetch from any replica, but followers can only fetch from the leader.
    */
+  // ============================================================
+  // fetchMessages: consumer 또는 follower의 fetch 요청을 처리하는 핵심 메서드
+  //
+  // 처리 흐름:
+  //   1. readFromLog()로 로컬 디스크에서 데이터를 읽는다
+  //   2. 충분한 데이터가 있으면 즉시 responseCallback 호출
+  //   3. 데이터가 부족하면 DelayedFetch를 purgatory에 등록하고
+  //      새 데이터가 도착하거나 maxWait 시간이 지나면 응답한다
+  // ============================================================
   def fetchMessages(params: FetchParams,
                     fetchInfos: Seq[(TopicIdPartition, PartitionData)],
                     quota: ReplicaQuota,
                     responseCallback: Seq[(TopicIdPartition, FetchPartitionData)] => Unit): Unit = {
 
-    // check if this fetch request can be satisfied right away
+    // 1단계: 로컬 로그에서 즉시 읽기 시도
+    // readFromPurgatory=false → fetch 상태 업데이트(lastFetchedEpoch 등) 포함
     val logReadResults = readFromLog(params, fetchInfos, quota, readFromPurgatory = false)
     var bytesReadable: Long = 0
     var errorReadingData = false
 
     // topic-partitions that have to be read from remote storage
+    // Tiered Storage(원격 저장소)에서 읽어야 하는 파티션 목록
     val remoteFetchInfos = new util.LinkedHashMap[TopicIdPartition, RemoteStorageFetchInfo]()
 
     var hasDivergingEpoch = false
@@ -1673,10 +1684,19 @@ class ReplicaManager(val config: KafkaConfig,
         hasDivergingEpoch = true
       if (logReadResult.preferredReadReplica.isPresent)
         hasPreferredReadReplica = true
+      // 전체 읽은 바이트 합계 (minBytes 충족 여부 판단에 사용)
       bytesReadable = bytesReadable + logReadResult.info.records.sizeInBytes
       logReadResultMap.put(topicIdPartition, logReadResult)
     }
 
+    // 즉시 응답 조건 (아래 중 하나라도 해당하면 즉시 응답):
+    // 1) maxWaitMs <= 0: 대기 없이 즉시 응답 요청
+    // 2) fetchInfos가 비어있음: 읽을 파티션 없음
+    // 3) bytesReadable >= minBytes: 충분한 데이터 확보
+    // 4) 에러 발생: 에러가 있어도 즉시 응답 (클라이언트가 재시도할 수 있도록)
+    // 5) divergingEpoch: leader epoch 불일치 → 즉시 알려야 함
+    // 6) preferredReadReplica: 읽기 최적화를 위해 다른 레플리카로 리다이렉트
+    // 단, remoteFetchInfos가 비어있을 때만 즉시 응답 (원격 fetch는 별도 처리)
     // Respond immediately if no remote fetches are required and any of the below conditions is true
     //                        1) fetch request does not want to wait
     //                        2) fetch request does not require any data
@@ -1692,6 +1712,9 @@ class ReplicaManager(val config: KafkaConfig,
       }
       responseCallback(fetchPartitionData)
     } else {
+      // 데이터가 부족하고 대기가 필요한 경우: DelayedFetch를 생성하여 purgatory에 등록한다.
+      // 새 메시지가 도착하거나 maxWaitMs가 지나면 DelayedFetch가 완료되며
+      // responseCallback을 통해 응답을 보낸다.
       // construct the fetch results from the read results
       val fetchPartitionStatus = new util.LinkedHashMap[TopicIdPartition, FetchPartitionStatus]
       fetchInfos.foreach { case (topicIdPartition, partitionData) =>
@@ -1729,9 +1752,20 @@ class ReplicaManager(val config: KafkaConfig,
     }
   }
 
-  /**
-   * Read from multiple topic partitions at the given offset up to maxSize bytes
-   */
+  // ============================================================
+  // readFromLog: 여러 파티션에서 동시에 로그를 읽는 핵심 메서드
+  //
+  // 핵심 동작 - "바이트 예산 기반 공정 분배":
+  //   - 모든 파티션이 params.maxBytes를 공유한다
+  //   - 앞 파티션이 읽은 만큼 뒤 파티션의 가용 바이트가 줄어든다
+  //   - 첫 번째 비어있지 않은 파티션은 바이트 제한을 무시할 수 있다 (minOneMessage=true)
+  //   - 결과적으로 파티션 순서가 바이트 할당에 영향을 미친다
+  //
+  // 파티션 순서:
+  //   - 순서는 호출자(KafkaApis)가 결정한다 (FetchRequest의 파티션 순서 유지)
+  //   - Kafka는 특정 파티션을 우선시하는 별도 정렬 로직이 없다
+  //   - 즉, 요청에서 먼저 나열된 파티션이 더 많은 바이트를 확보할 가능성이 높다
+  // ============================================================
   def readFromLog(
     params: FetchParams,
     readPartitionInfo: Seq[(TopicIdPartition, PartitionData)],
@@ -1855,6 +1889,19 @@ class ReplicaManager(val config: KafkaConfig,
       }
     }
 
+    // ============================================================
+    // 파티션별 바이트 예산 분배 루프
+    //
+    // limitBytes: 남은 전체 응답 예산 (처음에는 params.maxBytes)
+    // minOneMessage: true일 때는 limitBytes=0이어도 최소 1개 메시지를 읽는다
+    //   → 첫 번째로 데이터가 있는 파티션만 이 혜택을 받는다
+    //   → 이후 파티션은 limitBytes에 따라 데이터를 읽거나 빈 응답이 된다
+    //
+    // 예시 (maxBytes=100KB, 파티션 A/B/C 순서):
+    //   A: 읽음 35KB → limitBytes = 100-35 = 65KB, minOneMessage=false
+    //   B: 읽음 60KB → limitBytes = 65-60 = 5KB
+    //   C: 최대 5KB → limitBytes = 5-2 = 3KB (예산 거의 소진)
+    // ============================================================
     var limitBytes = params.maxBytes
     val result = new mutable.ArrayBuffer[(TopicIdPartition, LogReadResult)]
     var minOneMessage = true
@@ -1863,11 +1910,14 @@ class ReplicaManager(val config: KafkaConfig,
       val recordBatchSize = readResult.info.records.sizeInBytes
       // Because we don't know how much data will be retrieved in remote fetch yet, and we don't want to block the API call
       // to query remoteLogMetadata, assume it will fetch the max bytes size of data to avoid to exceed the "fetch.max.bytes" setting.
+      // 원격 스토리지 fetch의 경우 실제 크기를 알 수 없으므로 최대값을 사용하여 예산 계산
       val estimatedRecordBatchSize = if (recordBatchSize == 0 && readResult.info.delayedRemoteStorageFetch.isPresent)
         readResult.info.delayedRemoteStorageFetch.get.fetchMaxBytes else recordBatchSize
+      // 데이터가 읽혔으면 이후 파티션은 최소 1메시지 보장 없이 limitBytes에 따라 읽는다
       // Once we read from a non-empty partition, we stop ignoring request and partition level size limits
       if (estimatedRecordBatchSize > 0)
         minOneMessage = false
+      // 남은 예산 감소 (0 이하로 내려가지 않도록 max(0, ...) 처리)
       limitBytes = math.max(0, limitBytes - estimatedRecordBatchSize)
       result += (tp -> readResult)
     }

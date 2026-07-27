@@ -552,19 +552,73 @@ class KafkaApis(val requestChannel: RequestChannel,
   /**
    * Handle a fetch request
    */
+  // ============================================================
+  // handleFetchRequest: consumer의 poll() 요청 진입점
+  //
+  // consumer가 KafkaConsumer.poll()을 호출하면, 내부적으로
+  // FetchRequest를 브로커에 전송한다. 이 메서드가 그 요청을 처리한다.
+  //
+  // FetchRequest에는 consumer가 읽고 싶은 파티션 목록이 담겨 있다.
+  // 각 파티션마다 { fetchOffset, maxBytes, logStartOffset } 정보가 포함된다.
+  // ============================================================
+    /*
+    * Q: 여러 파티션에서 어떤 파티션 데이터를 먼저 반환하나?
+
+  Kafka는 별도의 파티션 우선순위 정렬 로직이 없습니다. 파티션 순서는 consumer의 FetchRequest에서 보낸 순서 그대로 유지됩니다(ReplicaManager.scala:1908). FetchRequest를 만들 때 consumer 클라이언트가 파티션을 나열하는 순서가 곧 처리 순서입니다.
+
+  Q: 바이트 예산은 어떻게 분배되나?
+
+  readFromLog의 루프(:1892)에서:
+  - 전체 maxBytes 예산을 파티션이 순서대로 사용한다
+  - 앞 파티션이 더 많은 바이트를 가져갈 수 있다
+  - 첫 번째로 데이터가 있는 파티션만 minOneMessage=true로 바이트 제한을 무시할 수 있다
+  - 예산이 소진되면 나머지 파티션은 빈 응답(records = [])이 된다
+
+  Q: FetchResponse 포맷은?
+
+  processResponseCallback(:649)에 주석으로 정리됩니다:
+  FetchResponseData
+  ├── throttleTimeMs   (쿼터 초과 시 대기 시간)
+  ├── sessionId        (Incremental Fetch Session ID)
+  └── responses[]
+      └── TopicResponse
+          ├── topicId / topic
+          └── partitions[]
+              └── PartitionData
+                  ├── highWatermark  (consumer가 읽을 수 있는 최대 offset)
+                  ├── lastStableOffset (READ_COMMITTED용)
+                  ├── logStartOffset
+                  ├── records        (실제 메시지 바이트, MemoryRecords)
+                  └── abortedTransactions (READ_COMMITTED 시)
+
+  Q: isolation level의 역할은?
+
+  UnifiedLog.read(:1227)에서 결정됩니다:
+  - READ_UNCOMMITTED (기본): highWatermark까지만 → ISR이 확인한 메시지만 consumer에게 전달
+  - READ_COMMITTED: lastStableOffset까지만 → 완료된 트랜잭션 메시지만
+
+    * */
   def handleFetchRequest(request: RequestChannel.Request): Unit = {
     val versionId = request.header.apiVersion
     val clientId = request.header.clientId
     val fetchRequest = request.body[FetchRequest]
+
+    // FetchRequest v13 이상부터 topicId(UUID)로 토픽을 식별한다.
+    // 이전 버전은 토픽 이름(String)을 직접 사용했으므로, 버전에 따라 매핑 방식이 다르다.
     val topicNames =
       if (fetchRequest.version() >= 13)
         metadataCache.topicIdsToNames()
       else
         Collections.emptyMap[Uuid, String]()
 
+    // 이번 요청에서 읽어야 할 파티션 목록 (TopicIdPartition -> PartitionData)
     val fetchData = fetchRequest.fetchData(topicNames)
+    // Incremental Fetch Session에서 더 이상 추적하지 않아도 되는 파티션 목록
     val forgottenTopics = fetchRequest.forgottenTopics(topicNames)
 
+    // FetchContext: Incremental Fetch Session을 관리한다.
+    // Fetch Session을 사용하면, 매번 전체 파티션 목록을 전송하지 않고
+    // 변경된 파티션만 포함하여 네트워크 오버헤드를 줄인다.
     val fetchContext = fetchManager.newContext(
       fetchRequest.version,
       fetchRequest.metadata,
@@ -573,6 +627,9 @@ class KafkaApis(val requestChannel: RequestChannel,
       forgottenTopics,
       topicNames)
 
+    // 파티션을 두 그룹으로 분리한다:
+    // - erroneous: 권한 없음, 존재하지 않는 토픽/파티션 등 즉시 에러를 반환할 파티션
+    // - interesting: 실제 데이터를 읽어야 할 파티션 (처리 순서가 여기서 결정됨)
     val erroneous = mutable.ArrayBuffer[(TopicIdPartition, FetchResponseData.PartitionData)]()
     val interesting = mutable.ArrayBuffer[(TopicIdPartition, FetchRequest.PartitionData)]()
     if (fetchRequest.isFromFollower) {
@@ -593,6 +650,9 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
     } else {
       // Regular Kafka consumers need READ permission on each partition they are fetching.
+      // consumer는 각 파티션에 대해 READ 권한이 있어야 한다.
+      // foreachPartition은 FetchContext가 관리하는 파티션 목록을 순서대로 순회한다.
+      // 이 순서가 곧 응답에서 파티션 데이터가 나타나는 순서가 된다.
       val partitionDatas = new mutable.ArrayBuffer[(TopicIdPartition, FetchRequest.PartitionData)]
       fetchContext.foreachPartition { (topicIdPartition, partitionData) =>
         if (topicIdPartition.topic == null)
@@ -623,8 +683,34 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
     }
 
-    // the callback for process a fetch response, invoked before throttling
+    // ============================================================
+    // processResponseCallback: 디스크 읽기가 완료된 후 FetchResponse를 조립하는 콜백
+    //
+    // ReplicaManager.fetchMessages()가 각 파티션에서 데이터를 읽고 나면
+    // 이 콜백을 호출하여 최종 응답을 구성한다.
+    //
+    // FetchResponse 데이터 포맷:
+    //   FetchResponseData
+    //   ├── throttleTimeMs: 쿼터 초과 시 클라이언트가 기다려야 할 시간(ms)
+    //   ├── errorCode: 세션 수준 에러 코드
+    //   ├── sessionId: Incremental Fetch Session ID
+    //   └── responses: List[TopicResponse]
+    //       └── TopicResponse
+    //           ├── topicId (v13+) 또는 topic (String, v13 미만)
+    //           └── partitions: List[PartitionData]
+    //               └── PartitionData
+    //                   ├── partitionIndex: 파티션 번호
+    //                   ├── errorCode: 파티션 수준 에러
+    //                   ├── highWatermark: 현재 HW offset (consumer가 읽을 수 있는 최대 offset)
+    //                   ├── lastStableOffset: READ_COMMITTED 격리 수준의 최대 offset
+    //                   ├── logStartOffset: 이 파티션 로그의 시작 offset
+    //                   ├── abortedTransactions: READ_COMMITTED 시 중단된 트랜잭션 목록
+    //                   ├── preferredReadReplica: Follower Fetch 최적화용 권장 읽기 레플리카
+    //                   └── records: 실제 레코드 배치 (MemoryRecords, 바이너리 포맷)
+    // ============================================================
     def processResponseCallback(responsePartitionData: Seq[(TopicIdPartition, FetchPartitionData)]): Unit = {
+      // LinkedHashMap을 사용하여 파티션 순서를 보장한다.
+      // Fetch API v3+에서는 응답의 파티션 순서가 요청과 동일해야 한다는 스펙이 있다.
       val partitions = new util.LinkedHashMap[TopicIdPartition, FetchResponseData.PartitionData]
       val reassigningPartitions = mutable.Set[TopicIdPartition]()
       val nodeEndpoints = new mutable.HashMap[Int, Node]
@@ -632,6 +718,8 @@ class KafkaApis(val requestChannel: RequestChannel,
         val abortedTransactions = data.abortedTransactions.orElse(null)
         val lastStableOffset: Long = data.lastStableOffset.orElse(FetchResponse.INVALID_LAST_STABLE_OFFSET)
         if (data.isReassignmentFetch) reassigningPartitions.add(topicIdPartition)
+        // 각 파티션의 응답 데이터를 조립한다.
+        // records: 실제 메시지 데이터 (Log Segment에서 읽은 바이트 그대로)
         val partitionData = new FetchResponseData.PartitionData()
           .setPartitionIndex(topicIdPartition.partition)
           .setErrorCode(maybeDownConvertStorageError(data.error).code)
@@ -642,6 +730,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           .setRecords(data.records)
           .setPreferredReadReplica(data.preferredReadReplica.orElse(FetchResponse.INVALID_PREFERRED_REPLICA_ID))
 
+        // v16+: NOT_LEADER 에러 시 현재 리더 정보를 함께 전달하여 클라이언트가 바로 재연결할 수 있게 한다
         if (versionId >= 16) {
           data.error match {
             case Errors.NOT_LEADER_OR_FOLLOWER | Errors.FENCED_LEADER_EPOCH =>
@@ -659,6 +748,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         data.divergingEpoch.ifPresent(epoch => partitionData.setDivergingEpoch(epoch))
         partitions.put(topicIdPartition, partitionData)
       }
+      // 에러 파티션들을 뒤에 추가한다 (순서: 성공 파티션 → 에러 파티션)
       erroneous.foreach { case (tp, data) => partitions.put(tp, data) }
 
       def recordBytesOutMetric(fetchResponse: FetchResponse): Unit = {
@@ -676,6 +766,7 @@ class KafkaApis(val requestChannel: RequestChannel,
 
       if (fetchRequest.isFromFollower) {
         // We've already evaluated against the quota and are good to go. Just need to record it now.
+        // follower fetch는 quota 검사를 별도로 하지 않고 바로 응답을 생성한다.
         val fetchResponse = fetchContext.updateAndGenerateResponseData(partitions, Seq.empty.asJava)
         val responseSize = KafkaApis.sizeOfThrottledPartitions(versionId, fetchResponse, quotas.leader)
         quotas.leader.record(responseSize)
@@ -685,6 +776,9 @@ class KafkaApis(val requestChannel: RequestChannel,
         recordBytesOutMetric(fetchResponse)
         requestHelper.sendResponseExemptThrottle(request, fetchResponse)
       } else {
+        // consumer fetch: bandwidth quota와 request quota 두 가지를 모두 체크한다.
+        // 둘 다 초과됐으면 더 큰 throttle time을 사용한다.
+        // 쿼터 초과 시에는 빈 응답(records 없음)을 반환하고 throttleTimeMs에 대기 시간을 설정한다.
         // Record both bandwidth and request quota-specific values and throttle by muting the channel if any of the
         // quotas have been violated. If both quotas have been violated, use the max throttle time between the two
         // quotas. When throttled, we unrecord the recorded bandwidth quota value.
@@ -705,9 +799,11 @@ class KafkaApis(val requestChannel: RequestChannel,
             requestHelper.throttle(quotas.request, request, requestThrottleTimeMs)
           }
           // If throttling is required, return an empty response.
+          // throttle 시: records 없이 throttleTimeMs만 담긴 빈 응답을 반환
           fetchContext.getThrottledResponse(maxThrottleTimeMs, nodeEndpoints.values.toSeq.asJava)
         } else {
           // Get the actual response. This will update the fetch context.
+          // 정상 응답: FetchContext가 Incremental Fetch Session 상태를 업데이트하고 최종 응답을 생성한다
           val fetchResponse = fetchContext.updateAndGenerateResponseData(partitions, nodeEndpoints.values.toSeq.asJava)
           val responsePartitionsSize = fetchResponse.data().responses().stream().mapToInt(_.partitions().size()).sum()
           trace(s"Sending Fetch response with partitions.size=$responsePartitionsSize, " +
@@ -724,6 +820,11 @@ class KafkaApis(val requestChannel: RequestChannel,
     if (interesting.isEmpty) {
       processResponseCallback(Seq.empty)
     } else {
+      // consumer fetch에서 fetchMaxBytes는 세 값의 최솟값으로 결정된다:
+      //   1) client가 요청한 maxBytes (fetch.max.bytes consumer 설정)
+      //   2) 브로커 설정 fetch.max.bytes
+      //   3) quota window 내에서 throttle 없이 fetch 가능한 최대 바이트
+      // → 이 값이 여러 파티션이 공유하는 "전체 응답 바이트 예산"이 된다.
       // for fetch from consumer, cap fetchMaxBytes to the maximum bytes that could be fetched without being throttled given
       // no bytes were recorded in the recent quota window
       // trying to fetch more bytes would result in a guaranteed throttling potentially blocking consumer progress
@@ -737,6 +838,7 @@ class KafkaApis(val requestChannel: RequestChannel,
 
       val clientMetadata: Optional[ClientMetadata] = if (versionId >= 11) {
         // Fetch API version 11 added preferred replica logic
+        // v11+: 클라이언트의 rack 정보를 사용하여 rack-aware follower fetch 가능
         Optional.of(new DefaultClientMetadata(
           fetchRequest.rackId,
           clientId,
@@ -747,6 +849,11 @@ class KafkaApis(val requestChannel: RequestChannel,
         Optional.empty()
       }
 
+      // FetchParams: ReplicaManager에 전달할 fetch 파라미터를 캡슐화한다.
+      // - maxWait: 데이터가 minBytes에 못 미칠 때 최대 대기 시간 (fetch.max.wait.ms)
+      // - minBytes: 응답 전 최소 바이트 수 (fetch.min.bytes)
+      // - maxBytes: 전체 응답의 최대 바이트 수 (fetch.max.bytes)
+      // - isolation: READ_UNCOMMITTED(일반) 또는 READ_COMMITTED(트랜잭션)
       val params = new FetchParams(
         fetchRequest.replicaId,
         fetchRequest.replicaEpoch,
@@ -757,6 +864,9 @@ class KafkaApis(val requestChannel: RequestChannel,
         clientMetadata
       )
 
+      // ReplicaManager에 실제 디스크 읽기를 위임한다.
+      // interesting: 권한/메타데이터 검증을 통과한 파티션 목록 (요청 순서 유지)
+      // processResponseCallback: 읽기 완료 후 응답을 조립하고 전송하는 콜백
       // call the replica manager to fetch messages from the local replica
       replicaManager.fetchMessages(
         params = params,
